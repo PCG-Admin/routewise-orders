@@ -27,7 +27,7 @@ export default function DashboardLayout({
     <div className="flex h-screen bg-slate-50 relative overflow-hidden">
       {/* Decorative Light Blob */}
       <div className="absolute top-0 left-0 w-[500px] h-[500px] bg-blue-500/10 rounded-full blur-3xl -translate-x-1/2 -translate-y-1/2 pointer-events-none z-0"></div>
-      
+
       {/* Sidebar */}
       <aside
         className={`${isSidebarOpen ? "w-64" : "w-20"
@@ -55,42 +55,46 @@ export default function DashboardLayout({
         </div>
 
         <nav className="flex-1 overflow-y-auto py-4 space-y-1">
-          <Link
-            href="#"
-            className={`flex items-center ${isSidebarOpen ? "gap-3 px-6" : "justify-center"} py-3 text-sm font-medium hover:bg-gradient-to-r hover:from-blue-600/20 hover:to-transparent border-l-2 border-transparent hover:border-blue-400 transition-colors group`}
-            title="Visits & Access Controls"
-          >
-            <Users className="w-5 h-5 text-slate-400 group-hover:text-blue-400 transition-colors flex-shrink-0" />
-            {isSidebarOpen && (
-              <>
-                <span className="text-slate-300 group-hover:text-white transition-colors">Visits & Access Controls</span>
-                <ChevronDown className="w-4 h-4 ml-auto text-slate-500 flex-shrink-0" />
-              </>
+
+
+
+          <div>
+            <button
+              onClick={() => {
+                if (!isSidebarOpen) setIsSidebarOpen(true);
+                else setIsReportsOpen(!isReportsOpen);
+              }}
+              className={`w-full flex items-center ${isSidebarOpen ? "gap-3 px-6" : "justify-center"} py-3 text-sm font-medium transition-all group ${isReportsOpen ? "bg-gradient-to-r from-blue-600/20 to-transparent border-l-2 border-blue-500 shadow-[inset_2px_0_10px_rgba(59,130,246,0.1)]" : "hover:bg-gradient-to-r hover:from-blue-600/20 hover:to-transparent border-l-2 border-transparent hover:border-blue-400"}`}
+              title="Operations"
+            >
+              <BarChart2 className={`w-5 h-5 flex-shrink-0 transition-colors ${isReportsOpen ? "text-blue-400" : "text-slate-400 group-hover:text-blue-400"}`} />
+              {isSidebarOpen && (
+                <>
+                  <span className={isReportsOpen ? "text-white font-bold" : "text-slate-300 group-hover:text-white transition-colors"}>Operations</span>
+                  <ChevronDown
+                    className={`w-4 h-4 ml-auto transition-transform flex-shrink-0 ${isReportsOpen ? "rotate-180 text-blue-400" : "text-slate-500"
+                      }`}
+                  />
+                </>
+              )}
+            </button>
+            {isSidebarOpen && isReportsOpen && (
+              <div className="pl-14 py-2 space-y-3 border-l border-indigo-500/20 ml-8 mb-2 mt-1">
+                <Link
+                  href="/dashboard"
+                  className="block text-sm font-bold bg-gradient-to-r from-blue-400 to-indigo-300 bg-clip-text text-transparent"
+                >
+                  Orders
+                </Link>
+
+
+
+              </div>
             )}
-          </Link>
-          <Link
-            href="#"
-            className={`flex items-center ${isSidebarOpen ? "gap-3 px-6" : "justify-center"} py-3 text-sm font-medium hover:bg-gradient-to-r hover:from-blue-600/20 hover:to-transparent border-l-2 border-transparent hover:border-blue-400 transition-colors group`}
-            title="Business"
-          >
-            <Briefcase className="w-5 h-5 text-slate-400 group-hover:text-blue-400 transition-colors flex-shrink-0" />
-            {isSidebarOpen && (
-              <>
-                <span className="text-slate-300 group-hover:text-white transition-colors">Business</span>
-                <ChevronDown className="w-4 h-4 ml-auto text-slate-500 flex-shrink-0" />
-              </>
-            )}
-          </Link>
-          {isSidebarOpen && (
-            <div className="pl-14 py-1 space-y-1 border-l border-white/5 ml-8 mb-2">
-              <Link
-                href="#"
-                className="block py-2 text-sm text-slate-400 hover:text-blue-300 transition-colors"
-              >
-                Partners
-              </Link>
-            </div>
-          )}
+          </div>
+
+
+
 
           <div>
             <button
@@ -114,48 +118,26 @@ export default function DashboardLayout({
             </button>
             {isSidebarOpen && isReportsOpen && (
               <div className="pl-14 py-2 space-y-3 border-l border-indigo-500/20 ml-8 mb-2 mt-1">
+
                 <Link
-                  href="/dashboard"
-                  className="block text-sm font-bold bg-gradient-to-r from-blue-400 to-indigo-300 bg-clip-text text-transparent"
-                >
-                  Allocations
-                </Link>
-                <Link
-                  href="#"
-                  className="block text-sm text-slate-400 hover:text-blue-300 transition-colors"
+                  href="/dashboard/reports/overview"
+                  className={`block text-sm transition-colors ${pathname === "/dashboard/reports/overview" ? "text-blue-400 font-bold" : "text-slate-400 hover:text-blue-300"}`}
                 >
                   Overview
                 </Link>
                 <Link
-                  href="#"
-                  className="block text-sm text-slate-400 hover:text-blue-300 transition-colors"
+                  href="/dashboard/reports/order-reports"
+                  className={`block text-sm transition-colors ${pathname === "/dashboard/reports/order-reports" ? "text-blue-400 font-bold" : "text-slate-400 hover:text-blue-300"}`}
                 >
                   Order Reports
                 </Link>
                 <Link
-                  href="#"
-                  className="block text-sm text-slate-400 hover:text-blue-300 transition-colors"
+                  href="/dashboard/reports/logistics"
+                  className={`block text-sm transition-colors ${pathname === "/dashboard/reports/logistics" ? "text-blue-400 font-bold" : "text-slate-400 hover:text-blue-300"}`}
                 >
                   Logistics
                 </Link>
-                <Link
-                  href="#"
-                  className="block text-sm text-slate-400 hover:text-blue-300 transition-colors"
-                >
-                  Stockpiles
-                </Link>
-                <Link
-                  href="#"
-                  className="block text-sm text-slate-400 hover:text-blue-300 transition-colors"
-                >
-                  Analysis
-                </Link>
-                <Link
-                  href="#"
-                  className="block text-sm text-slate-400 hover:text-blue-300 transition-colors"
-                >
-                  Intelligence
-                </Link>
+
               </div>
             )}
           </div>
