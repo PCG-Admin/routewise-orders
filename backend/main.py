@@ -48,9 +48,11 @@ except Exception as e:
 
 # Gemini client (new google.genai SDK)
 gemini_client = None
+_genai_types = None
 if GEMINI_API_KEY:
     try:
-        from google import genai as _genai
+        from google import genai as _genai  # type: ignore[import]
+        from google.genai import types as _genai_types  # type: ignore[import]
         gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
         print("Gemini initialized!")
     except Exception as e:
@@ -377,13 +379,13 @@ def save_extracted_to_db(extracted: dict, filename: str) -> dict:
 
 GEMINI_PROMPT = """You are a data extraction AI for a South African bulk transport management system.
 
-Parse the following document and return ONLY a valid JSON object (no markdown, no code fences, just raw JSON) with this structure:
+Parse the document and return ONLY a valid JSON object (no markdown, no code fences, just raw JSON):
 
 {
-  "orderNumber": "e.g. ELD26-05-30 or null",
+  "orderNumber": "order number string or null",
   "clientName": "mine or company name or null",
-  "product": "product code or description or null",
-  "orderQty": total_quantity_as_number_or_null,
+  "product": "product code e.g. CHR001 or null",
+  "orderQty": total_quantity_tonnes_as_number_or_null,
   "unit": "tons",
   "originAddress": "source mine/site or null",
   "destinationAddress": "destination port or city or null",
@@ -398,129 +400,178 @@ Parse the following document and return ONLY a valid JSON object (no markdown, n
       "trailer2": "second trailer plate or null",
       "driverId": "driver ID number or null",
       "ticketNo": "weighbridge ticket or transaction number or null",
-      "grossWeight": gross_kg_as_number_or_null,
-      "tareWeight": tare_kg_as_number_or_null,
-      "netWeight": net_kg_as_number_or_null,
+      "grossWeight": gross_kg_as_integer_or_null,
+      "tareWeight": tare_kg_as_integer_or_null,
+      "netWeight": net_kg_as_integer_or_null,
       "scheduledDate": "YYYY-MM-DD or null",
       "status": "scheduled"
     }
   ]
 }
 
-Rules:
-- For WEIGHBRIDGE / WDR reports: every transaction row = one truck entry. vehicleReg = TRUCK REG column, ticketNo = TRAN NO column, driverName = USER column, weights are in kg.
-- For EXCEL truck lists: every data row = one truck entry.
-- Include ALL rows found - do not summarise or skip any.
-- vehicleReg is REQUIRED. Skip rows that have no vehicle registration.
-- Weights must be plain numbers (integers or decimals). No units in the number.
-- All dates must be YYYY-MM-DD format.
-- Return ONLY the raw JSON. No explanation. No markdown.
+WEIGHBRIDGE DETAIL REPORT (WDR) — Newton system used at South African mines:
+- ORDER NUMBER: extract from the "ORDER NUMBER:" summary box at the bottom of the report (e.g. ELD26-05-30, ZDE26-05-46), NOT from the ORDERNO column in the table rows
+- clientName: from the report title header e.g. "NORTHAM ELAND", "FARM ZONDEREINDE"
+- originAddress: mine name from the report title
+- orderQty: from "ORDER QTY:" in the summary box (value is already in tonnes)
+- pickupDate: date portion of the "Filter Range" start date, format YYYY-MM-DD
+- Each DISP transaction row = one truck entry:
+  - TRUCK REG column → vehicleReg (e.g. LGZ388MP)
+  - TRAN NO column → ticketNo (e.g. 1001301 or 136262)
+  - TARE column → tareWeight in kg (e.g. 19050)
+  - GROSS column → grossWeight in kg (e.g. 56950)
+  - NETT column → netWeight in kg (e.g. 37900)
+  - TRANSPORTER column → transporter (e.g. VRC)
+  - PRODUCT column → product (e.g. CHR001)
+  - DEST column → destinationAddress (e.g. DBN, BC)
+  - SUPPLIER column → originAddress on truck row (can leave null, use report-level originAddress)
+  - USER column is a weighbridge OPERATOR, NOT the truck driver — set driverName to null
+  - Set status = "completed" for all WDR trucks (they have been weighed and dispatched)
+
+GENERAL RULES:
+- Include ALL transaction rows — do not skip or summarise any
+- vehicleReg is REQUIRED — skip rows with no truck registration
+- Weight values must be plain integers. No units
+- All dates must be YYYY-MM-DD
+- Return ONLY raw JSON — no explanation, no markdown
 
 DOCUMENT:
 """
 
+def _parse_gemini_response(raw_text: str) -> dict | None:
+    """Strip markdown fences and parse JSON from a Gemini response."""
+    try:
+        raw = raw_text.strip()
+        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
+        raw = re.sub(r'\s*```$', '', raw)
+        data = json.loads(raw.strip())
+        logger.info(f"Gemini parsed: {len(data.get('trucks', []))} trucks, order={data.get('orderNumber')}")
+        return data
+    except json.JSONDecodeError as e:
+        logger.error(f"Gemini JSON parse error: {e} — raw: {raw_text[:400]}")
+        return None
+
 def call_gemini(text: str) -> dict | None:
-    """Call Gemini to extract structured data. Returns parsed dict or None on failure."""
+    """Call Gemini with plain text. Returns parsed dict or None."""
     if not gemini_client:
-        logger.warning("Gemini not configured")
         return None
     if not text or len(text.strip()) < 50:
-        logger.warning("Text too short for Gemini")
         return None
-    raw = ""
     try:
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
             contents=GEMINI_PROMPT + text[:30000]
         )
-        raw = response.text.strip()
-        # Strip markdown code fences if Gemini wraps the response
-        raw = re.sub(r'^```(?:json)?\s*', '', raw, flags=re.IGNORECASE)
-        raw = re.sub(r'\s*```$', '', raw)
-        raw = raw.strip()
-        data = json.loads(raw)
-        logger.info(f"Gemini extracted {len(data.get('trucks', []))} trucks, order={data.get('orderNumber')}")
-        return data
-    except json.JSONDecodeError as e:
-        logger.error(f"Gemini returned invalid JSON: {e}")
-        logger.error(f"Raw (first 500): {raw[:500]}")
-        return None
+        return _parse_gemini_response(response.text)
     except Exception as e:
-        logger.error(f"Gemini call failed: {e}")
+        logger.error(f"Gemini text call failed: {e}")
         return None
 
 # ============================================
-# PDF UPLOAD — OCR + GEMINI
+# PDF UPLOAD — GEMINI NATIVE + IMAGE OCR + TEXT FALLBACK
 # ============================================
 
-def extract_pdf_text_pypdf2(file_bytes: bytes) -> str:
-    """Fast text extraction using PyPDF2."""
+def _pdf_text_pypdf2(file_bytes: bytes) -> str:
+    """Extract text from a PDF using PyPDF2."""
     try:
         reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        parts = []
-        for page in reader.pages:
-            t = page.extract_text()
-            if t:
-                parts.append(t)
+        parts = [p for page in reader.pages if (p := page.extract_text())]
         return "\n".join(parts)
     except Exception as e:
         logger.error(f"PyPDF2 error: {e}")
         return ""
 
-def extract_pdf_text_ocr(file_bytes: bytes) -> str:
-    """OCR fallback using pdf2image + pytesseract (requires Tesseract binary installed)."""
+def call_gemini_with_pdf_bytes(pdf_bytes: bytes) -> dict | None:
+    """
+    Send the PDF file directly to Gemini for native PDF+vision extraction.
+    Best path — Gemini reads layout, tables, and text in one shot.
+    """
+    if not gemini_client or not _genai_types:
+        return None
     try:
-        from pdf2image import convert_from_bytes
-        import pytesseract
-        images = convert_from_bytes(file_bytes, dpi=200)
-        parts = []
-        for img in images:
-            text = pytesseract.image_to_string(img, config='--psm 6')
-            if text:
-                parts.append(text)
-        result = "\n".join(parts)
-        logger.info(f"OCR extracted {len(result)} chars from {len(images)} page(s)")
-        return result
-    except ImportError:
-        logger.warning("OCR unavailable: pdf2image/pytesseract not installed")
-        return ""
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                _genai_types.Content(
+                    role="user",
+                    parts=[
+                        _genai_types.Part.from_text(GEMINI_PROMPT),
+                        _genai_types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                    ],
+                )
+            ],
+        )
+        return _parse_gemini_response(response.text)
     except Exception as e:
-        if "tesseract" in str(e).lower():
-            logger.warning("OCR unavailable: Tesseract binary not installed on system")
-        else:
-            logger.error(f"OCR error: {e}")
-        return ""
+        logger.error(f"Gemini native PDF failed: {e}")
+        return None
+
+def call_gemini_with_pdf_images(pdf_bytes: bytes) -> dict | None:
+    """
+    Convert each PDF page to a JPEG image and send all pages to Gemini.
+    OCR path — works for scanned or image-only PDFs.
+    """
+    if not gemini_client or not _genai_types:
+        return None
+    try:
+        from pdf2image import convert_from_bytes  # type: ignore[import]
+        images = convert_from_bytes(pdf_bytes, dpi=200)
+        logger.info(f"PDF→images: {len(images)} page(s)")
+        parts = [_genai_types.Part.from_text(GEMINI_PROMPT)]
+        for img in images[:6]:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            parts.append(_genai_types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[_genai_types.Content(role="user", parts=parts)],
+        )
+        return _parse_gemini_response(response.text)
+    except ImportError:
+        logger.warning("pdf2image not installed — skipping image OCR path")
+        return None
+    except Exception as e:
+        logger.error(f"Gemini image OCR failed: {e}")
+        return None
 
 @app.post("/api/upload/pdf")
 async def upload_pdf(file: UploadFile = File(...)):
-    """Upload weighbridge PDF — OCR + Gemini AI extraction."""
+    """
+    Upload a weighbridge / WDR PDF.
+    Cascade: Gemini native PDF → Gemini image OCR → PyPDF2 text + Gemini text.
+    """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not connected")
 
     logger.info(f"PDF upload: {file.filename}")
     try:
         contents = await file.read()
+        extracted = None
 
-        # Step 1: Try fast text extraction
-        pdf_text = extract_pdf_text_pypdf2(contents)
-        logger.info(f"PyPDF2 got {len(pdf_text)} chars")
+        # Path 1 — Gemini reads the PDF natively (best for structured WDR tables)
+        if gemini_client:
+            logger.info("Trying Gemini native PDF extraction…")
+            extracted = call_gemini_with_pdf_bytes(contents)
 
-        # Step 2: If text is too sparse, fall back to OCR
-        if len(pdf_text.strip()) < 200:
-            logger.info("Text too sparse — falling back to OCR")
-            pdf_text = extract_pdf_text_ocr(contents)
+        # Path 2 — Gemini reads page images (handles image-only / scanned PDFs)
+        if not extracted and gemini_client:
+            logger.info("Trying Gemini image OCR extraction…")
+            extracted = call_gemini_with_pdf_images(contents)
 
-        if not pdf_text.strip():
-            raise HTTPException(status_code=400, detail="Could not extract any text from PDF")
-
-        # Step 3: Gemini AI extraction
-        extracted = call_gemini(pdf_text)
+        # Path 3 — Classic PyPDF2 text → Gemini text (last resort)
         if not extracted:
-            raise HTTPException(status_code=422, detail="AI could not parse the PDF content. Ensure the PDF contains readable weighbridge or order data.")
+            logger.info("Falling back to PyPDF2 text extraction…")
+            pdf_text = _pdf_text_pypdf2(contents)
+            if pdf_text.strip():
+                extracted = call_gemini(pdf_text)
 
-        # Step 4: Save to database
+        if not extracted:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not parse this PDF. Ensure it is a Newton weighbridge report (WDR) or a supported order document.",
+            )
+
         summary = save_extracted_to_db(extracted, file.filename)
-
         return {
             "success": True,
             "message": f"Extracted {summary['trucks_added']} trucks for order {summary['orderNumber']}",
