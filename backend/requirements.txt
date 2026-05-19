@@ -3,8 +3,11 @@ uvicorn
 supabase
 python-multipart
 openpyxl
+pandas
 google-generativeai
 PyPDF2
+pdf2image
+pytesseract
+pillow
 python-dotenv
 httpx
-pydantic
