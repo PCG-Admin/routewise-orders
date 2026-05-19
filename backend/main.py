@@ -22,7 +22,7 @@ app = FastAPI(title="Bulk Connections API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002","https://bulk-01.vercel.app"],
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002","https://bulk-01.vercel.app","bulk-01-git-main-alisonrajpals-projects.vercel.app","bulk-01-fb1phx28x-alisonrajpals-projects.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
