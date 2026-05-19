@@ -479,66 +479,41 @@ def _pdf_text_pypdf2(file_bytes: bytes) -> str:
         logger.error(f"PyPDF2 error: {e}")
         return ""
 
-def call_gemini_with_pdf_bytes(pdf_bytes: bytes) -> dict | None:
+def extract_pdf_via_ocr(file_bytes: bytes) -> str:
     """
-    Send the PDF file directly to Gemini for native PDF+vision extraction.
-    Uses the dict-based content API for maximum SDK-version compatibility.
+    Convert PDF pages to images with pdf2image + Pillow, then run pytesseract OCR.
+    Returns the full extracted text across all pages.
     """
-    if not gemini_client:
-        return None
-    try:
-        import base64
-        pdf_b64 = base64.b64encode(pdf_bytes).decode()
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[{
-                "role": "user",
-                "parts": [
-                    {"text": GEMINI_PROMPT},
-                    {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
-                ],
-            }],
-        )
-        return _parse_gemini_response(response.text)
-    except Exception as e:
-        logger.error(f"Gemini native PDF failed: {e}")
-        return None
-
-def call_gemini_with_pdf_images(pdf_bytes: bytes) -> dict | None:
-    """
-    Convert each PDF page to a JPEG image and send all pages to Gemini.
-    OCR path — handles scanned/image-only PDFs. Requires pdf2image + poppler.
-    """
-    if not gemini_client:
-        return None
     try:
         from pdf2image import convert_from_bytes  # type: ignore[import]
-        import base64
-        images = convert_from_bytes(pdf_bytes, dpi=200)
-        logger.info(f"PDF→images: {len(images)} page(s)")
-        parts: list = [{"text": GEMINI_PROMPT}]
-        for img in images[:6]:
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=85)
-            img_b64 = base64.b64encode(buf.getvalue()).decode()
-            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[{"role": "user", "parts": parts}],
-        )
-        return _parse_gemini_response(response.text)
-    except ImportError:
-        logger.warning("pdf2image not installed — skipping image OCR path")
-        return None
+        import pytesseract  # type: ignore[import]
+        from PIL import Image  # type: ignore[import]
+
+        images = convert_from_bytes(file_bytes, dpi=300)
+        logger.info(f"pdf2image: {len(images)} page(s)")
+        parts = []
+        for i, img in enumerate(images, start=1):
+            gray = img.convert("L")
+            text = pytesseract.image_to_string(gray, config="--psm 6 --oem 3")
+            if text.strip():
+                parts.append(f"--- PAGE {i} ---\n{text}")
+                logger.info(f"Page {i} OCR: {len(text)} chars")
+        result = "\n".join(parts)
+        logger.info(f"Total OCR text: {len(result)} chars")
+        return result
+    except ImportError as e:
+        logger.warning(f"OCR library missing ({e}) — skipping OCR path")
+        return ""
     except Exception as e:
-        logger.error(f"Gemini image OCR failed: {e}")
-        return None
+        logger.error(f"OCR extraction error: {e}")
+        return ""
 
 @app.post("/api/upload/pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     """
     Upload a weighbridge / WDR PDF.
-    Cascade: Gemini native PDF → Gemini image OCR → PyPDF2 text + Gemini text.
+    Pipeline: pdf2image + pytesseract OCR → Gemini Flash 2.5 extraction.
+    Fallback: PyPDF2 text → Gemini Flash 2.5.
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not connected")
@@ -548,21 +523,18 @@ async def upload_pdf(file: UploadFile = File(...)):
         contents = await file.read()
         extracted = None
 
-        # Path 1 — Gemini reads the PDF natively (best for structured WDR tables)
-        if gemini_client:
-            logger.info("Trying Gemini native PDF extraction…")
-            extracted = call_gemini_with_pdf_bytes(contents)
+        # Step 1 — pdf2image + pytesseract OCR → Gemini Flash 2.5
+        ocr_text = extract_pdf_via_ocr(contents)
+        if ocr_text.strip():
+            logger.info(f"OCR text ({len(ocr_text)} chars) → Gemini Flash 2.5")
+            extracted = call_gemini(ocr_text)
 
-        # Path 2 — Gemini reads page images (handles image-only / scanned PDFs)
-        if not extracted and gemini_client:
-            logger.info("Trying Gemini image OCR extraction…")
-            extracted = call_gemini_with_pdf_images(contents)
-
-        # Path 3 — Classic PyPDF2 text → Gemini text (last resort)
+        # Step 2 — PyPDF2 text → Gemini Flash 2.5 (fallback for digital PDFs)
         if not extracted:
-            logger.info("Falling back to PyPDF2 text extraction…")
+            logger.info("OCR empty — falling back to PyPDF2 text extraction")
             pdf_text = _pdf_text_pypdf2(contents)
             if pdf_text.strip():
+                logger.info(f"PyPDF2 text ({len(pdf_text)} chars) → Gemini Flash 2.5")
                 extracted = call_gemini(pdf_text)
 
         if not extracted:
