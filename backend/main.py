@@ -48,11 +48,9 @@ except Exception as e:
 
 # Gemini client (new google.genai SDK)
 gemini_client = None
-_genai_types = None
 if GEMINI_API_KEY:
     try:
         from google import genai as _genai  # type: ignore[import]
-        from google.genai import types as _genai_types  # type: ignore[import]
         gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
         print("Gemini initialized!")
     except Exception as e:
@@ -484,22 +482,22 @@ def _pdf_text_pypdf2(file_bytes: bytes) -> str:
 def call_gemini_with_pdf_bytes(pdf_bytes: bytes) -> dict | None:
     """
     Send the PDF file directly to Gemini for native PDF+vision extraction.
-    Best path — Gemini reads layout, tables, and text in one shot.
+    Uses the dict-based content API for maximum SDK-version compatibility.
     """
-    if not gemini_client or not _genai_types:
+    if not gemini_client:
         return None
     try:
+        import base64
+        pdf_b64 = base64.b64encode(pdf_bytes).decode()
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=[
-                _genai_types.Content(
-                    role="user",
-                    parts=[
-                        _genai_types.Part.from_text(GEMINI_PROMPT),
-                        _genai_types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-                    ],
-                )
-            ],
+            contents=[{
+                "role": "user",
+                "parts": [
+                    {"text": GEMINI_PROMPT},
+                    {"inline_data": {"mime_type": "application/pdf", "data": pdf_b64}},
+                ],
+            }],
         )
         return _parse_gemini_response(response.text)
     except Exception as e:
@@ -509,22 +507,24 @@ def call_gemini_with_pdf_bytes(pdf_bytes: bytes) -> dict | None:
 def call_gemini_with_pdf_images(pdf_bytes: bytes) -> dict | None:
     """
     Convert each PDF page to a JPEG image and send all pages to Gemini.
-    OCR path — works for scanned or image-only PDFs.
+    OCR path — handles scanned/image-only PDFs. Requires pdf2image + poppler.
     """
-    if not gemini_client or not _genai_types:
+    if not gemini_client:
         return None
     try:
         from pdf2image import convert_from_bytes  # type: ignore[import]
+        import base64
         images = convert_from_bytes(pdf_bytes, dpi=200)
         logger.info(f"PDF→images: {len(images)} page(s)")
-        parts = [_genai_types.Part.from_text(GEMINI_PROMPT)]
+        parts: list = [{"text": GEMINI_PROMPT}]
         for img in images[:6]:
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=85)
-            parts.append(_genai_types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+            img_b64 = base64.b64encode(buf.getvalue()).decode()
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": img_b64}})
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=[_genai_types.Content(role="user", parts=parts)],
+            contents=[{"role": "user", "parts": parts}],
         )
         return _parse_gemini_response(response.text)
     except ImportError:
