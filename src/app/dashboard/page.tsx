@@ -124,12 +124,21 @@ export default function DashboardPage() {
   const fetchOrders = async () => {
     setLoading(true);
     try {
+      console.log("Fetching orders from:", `${API_URL}/api/orders`);
       const response = await fetch(`${API_URL}/api/orders`);
       const data = await response.json();
+
+      console.log("=== DEBUG ===");
+      console.log("Response status:", response.status);
+      console.log("Data received:", data);
+      console.log("Orders array:", data.orders);
+      console.log("Number of orders:", data.orders?.length);
 
       if (data.orders) {
         setOrders(data.orders);
         calculateStats(data.orders);
+      } else {
+        console.log("No orders found in response");
       }
     } catch (error) {
       console.error("Error fetching orders:", error);
@@ -367,7 +376,7 @@ export default function DashboardPage() {
       });
       const data = await response.json();
       setUploadResult(data);
-      if (data.success?.length) {
+      if (data.success) {
         fetchOrders();
       }
     } catch (error) {
@@ -388,7 +397,7 @@ export default function DashboardPage() {
       });
       const data = await response.json();
       setUploadResult(data);
-      if (data.matched_order) {
+      if (data.success) {
         fetchOrders();
       }
     } catch (error) {
@@ -1019,16 +1028,44 @@ export default function DashboardPage() {
 
                   <div className="flex items-start gap-2 mt-4 text-xs sm:text-sm text-blue-700 bg-blue-50 p-3 rounded-lg border border-blue-100">
                     <Info className="w-4 h-4 sm:w-5 sm:h-5 shrink-0 mt-0.5" />
-                    <p>PDF files are automatically processed using AI to extract order details, products, and routing information.</p>
+                    <p>AI automatically extracts all data from PDF weighbridge reports and Excel files. Use the template below for best Excel results.</p>
                   </div>
+
+                  <a
+                    href={`${API_URL}/api/template/excel`}
+                    download="truck_allocation_template.xlsx"
+                    className="mt-3 flex items-center justify-center gap-2 w-full px-4 py-2.5 border border-emerald-200 bg-emerald-50 text-emerald-700 rounded-xl text-sm font-semibold hover:bg-emerald-100 transition-all"
+                  >
+                    <Download className="w-4 h-4" />
+                    Download Excel Template
+                  </a>
                 </div>
 
                 {uploadResult && (
-                  <div className="mt-4 p-3 rounded-lg bg-gray-50 border border-gray-200">
-                    <p className="text-sm font-semibold mb-2">Upload Result:</p>
-                    <pre className="text-xs overflow-auto max-h-40">
-                      {JSON.stringify(uploadResult, null, 2)}
-                    </pre>
+                  <div className={`mt-4 p-4 rounded-xl border ${uploadResult.success ? 'bg-emerald-50 border-emerald-200' : 'bg-rose-50 border-rose-200'}`}>
+                    {uploadResult.success ? (
+                      <div className="flex items-start gap-3">
+                        <CheckSquare className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                        <div>
+                          <p className="text-sm font-bold text-emerald-800">Import Successful</p>
+                          <p className="text-sm text-emerald-700 mt-1">{uploadResult.message}</p>
+                          {uploadResult.orderNumber && (
+                            <p className="text-xs text-emerald-600 mt-1">Order: <span className="font-bold">{uploadResult.orderNumber}</span></p>
+                          )}
+                          {uploadResult.trucks_skipped > 0 && (
+                            <p className="text-xs text-amber-600 mt-1">{uploadResult.trucks_skipped} rows skipped (missing vehicle registration)</p>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex items-start gap-3">
+                        <AlertCircle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                        <div>
+                          <p className="text-sm font-bold text-rose-800">Import Failed</p>
+                          <p className="text-xs text-rose-600 mt-1">{uploadResult.detail || uploadResult.error || 'Unknown error'}</p>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
