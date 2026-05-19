@@ -6,7 +6,7 @@ import {
   ResponsiveContainer, PieChart, Pie, Cell,
 } from 'recharts';
 
-const API_URL = 'http://localhost:8000';
+const API_URL = 'https://bulk-01.onrender.com';
 const COLORS = ['#1E3A8A', '#0EA5E9', '#64748B', '#A855F7', '#22C55E', '#F59E0B', '#EF4444', '#10B981'];
 
 interface Stats {

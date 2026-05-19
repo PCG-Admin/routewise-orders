@@ -23,7 +23,7 @@ import {
 } from "lucide-react";
 
 // API Service
-const API_URL = 'http://localhost:8000';
+const API_URL = 'https://bulk-01.onrender.com';
 
 interface Order {
   id: string;
