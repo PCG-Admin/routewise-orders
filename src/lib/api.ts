@@ -1,5 +1,20 @@
 // API service for backend calls
-const API_URL = 'http://localhost:8000'; // Your FastAPI backend
+const API_URL = 'https://bulk-01.onrender.com'; // Your FastAPI backend
+
+export async function loginUser(email: string, password: string) {
+    const response = await fetch(`${API_URL}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+    });
+
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Login failed');
+    }
+
+    return response.json();
+}
 
 export async function uploadExcel(file: File, token: string) {
     const formData = new FormData();

@@ -22,7 +22,7 @@ app = FastAPI(title="Bulk Connections API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002"],
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:3002","https://bulk-01.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,6 +60,42 @@ async def root():
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+# ============================================
+# AUTHENTICATION
+# ============================================
+
+@app.post("/api/auth/login")
+async def login(credentials: dict):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not connected")
+
+    email = (credentials.get("email") or "").strip().lower()
+    password = credentials.get("password") or ""
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="Email and password are required")
+
+    try:
+        result = supabase.table("users").select("id,email,name,role,password").eq("email", email).execute()
+        if not result.data:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        user = result.data[0]
+        if user.get("password") != password:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+
+        return {
+            "id": user["id"],
+            "email": user["email"],
+            "name": user.get("name") or "",
+            "role": user.get("role") or "user",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        raise HTTPException(status_code=500, detail="Login failed")
 
 # ============================================
 # ORDERS CRUD
@@ -492,11 +528,369 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================
-# EXCEL UPLOAD — GEMINI AI
+# STATS & REPORTING
+# ============================================
+
+@app.get("/api/stats")
+async def get_stats():
+    """Aggregated stats for all report pages — orders + truck allocations."""
+    if not supabase:
+        return {}
+    try:
+        orders = supabase.table("orders").select("*").execute().data or []
+        trucks = supabase.table("truck_allocations").select("*").execute().data or []
+
+        total_orders = len(orders)
+        active_orders = sum(1 for o in orders if o.get("status") not in ("completed", "cancelled"))
+        total_trucks = len(trucks)
+
+        # Truck status breakdown
+        truck_status: dict = {}
+        for t in trucks:
+            s = t.get("status") or "scheduled"
+            truck_status[s] = truck_status.get(s, 0) + 1
+
+        # Product mix from orders
+        product_counts: dict = {}
+        for o in orders:
+            p = (o.get("product") or "Unknown").strip()
+            product_counts[p] = product_counts.get(p, 0) + 1
+        product_mix = [{"name": k, "value": v} for k, v in sorted(product_counts.items(), key=lambda x: -x[1])]
+
+        # Completed/total trucks per order
+        order_truck_map: dict = {}
+        for t in trucks:
+            oid = t.get("orderId")
+            if not oid:
+                continue
+            if oid not in order_truck_map:
+                order_truck_map[oid] = {"total": 0, "completed": 0}
+            order_truck_map[oid]["total"] += 1
+            if t.get("status") == "completed":
+                order_truck_map[oid]["completed"] += 1
+
+        order_completions = [
+            {
+                "id": o.get("orderNumber") or o["id"][:8],
+                "orderNumber": o.get("orderNumber"),
+                "clientName": o.get("clientName"),
+                "completed": order_truck_map.get(o["id"], {}).get("completed", 0),
+                "total": order_truck_map.get(o["id"], {}).get("total", 0),
+            }
+            for o in orders
+        ]
+
+        # Transporter stats
+        transporter_map: dict = {}
+        for t in trucks:
+            name = (t.get("transporter") or "Unknown").strip()
+            if name not in transporter_map:
+                transporter_map[name] = {"total": 0, "completed": 0}
+            transporter_map[name]["total"] += 1
+            if t.get("status") == "completed":
+                transporter_map[name]["completed"] += 1
+        transporter_stats = sorted(
+            [
+                {
+                    "name": k,
+                    "total": v["total"],
+                    "completed": v["completed"],
+                    "score": round((v["completed"] / v["total"]) * 100) if v["total"] > 0 else 0,
+                }
+                for k, v in transporter_map.items()
+            ],
+            key=lambda x: -x["total"],
+        )
+
+        # Client/mine stats
+        client_map: dict = {}
+        for o in orders:
+            c = (o.get("clientName") or "Unknown").strip()
+            if c not in client_map:
+                client_map[c] = {"orders": 0, "trucks": 0, "tonnes": 0.0, "product": o.get("product") or ""}
+            client_map[c]["orders"] += 1
+            client_map[c]["trucks"] += order_truck_map.get(o["id"], {}).get("total", 0)
+            client_map[c]["tonnes"] += float(o.get("quantity") or 0)
+        client_stats = sorted(
+            [{"name": k, "orders": v["orders"], "trucks": v["trucks"], "tonnes": round(v["tonnes"], 2), "product": v["product"]}
+             for k, v in client_map.items()],
+            key=lambda x: -x["tonnes"],
+        )
+
+        return {
+            "totalOrders": total_orders,
+            "activeOrders": active_orders,
+            "totalTrucks": total_trucks,
+            "truckStatus": truck_status,
+            "productMix": product_mix,
+            "orderCompletions": order_completions,
+            "transporterStats": transporter_stats,
+            "clientStats": client_stats,
+        }
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+        return {}
+
+
+@app.get("/api/trucks")
+async def get_all_trucks():
+    """All truck allocations across all orders (latest 500)."""
+    if not supabase:
+        return {"trucks": []}
+    try:
+        result = supabase.table("truck_allocations").select("*").limit(500).execute()
+        return {"trucks": result.data or []}
+    except Exception as e:
+        logger.error(f"Error fetching all trucks: {e}")
+        return {"trucks": []}
+
+# ============================================
+# EXCEL EXTRACTION — TEMPLATE ENGINE
+# ============================================
+
+def _first_row_texts(ws, row: int) -> list[str]:
+    """Return all distinct non-empty string values from a worksheet row (skips merged-cell duplicates)."""
+    seen, results = set(), []
+    for col in range(1, ws.max_column + 1):
+        v = ws.cell(row=row, column=col).value
+        if v is not None:
+            t = str(v).strip()
+            if t and t not in seen:
+                seen.add(t)
+                results.append(t)
+    return results
+
+def _map_headers(header_list: list[str]) -> dict[str, int]:
+    """Map normalised header strings → 0-based column index."""
+    lookup = {
+        "TRANSPORTER": "transporter",
+        "FLEET NO": "fleetNo", "FLEET": "fleetNo",
+        "HORSE REG": "vehicleReg", "HORSE": "vehicleReg", "VEHICLE REG": "vehicleReg",
+        "TRAILER 1": "trailer1", "TRAILER1": "trailer1",
+        "TRAILER 2": "trailer2", "TRAILER2": "trailer2",
+        "DRIVER NAME SURNAME": "driverName", "DRIVER NAME": "driverName", "DRIVER": "driverName",
+        "ID": "driverId", "DRIVER ID": "driverId", "DRIVER ID/NO": "driverId",
+        "SCHEDULED DATE": "scheduledDate", "DATE": "scheduledDate",
+        "TICKET NO": "ticketNo",
+        "GROSS WEIGHT": "grossWeight", "GROSS": "grossWeight",
+        "TARE WEIGHT": "tareWeight",  "TARE": "tareWeight",
+        "NET WEIGHT": "netWeight",    "NET": "netWeight",
+    }
+    mapping = {}
+    for idx, h in enumerate(header_list):
+        key = str(h).strip().upper().rstrip(" *:")
+        if key in lookup:
+            mapping[lookup[key]] = idx
+    return mapping
+
+def _read_truck_row(ws, row: int, col_map: dict, num_cols: int) -> dict | None:
+    """Read one data row; return a truck dict or None if the row is fully empty."""
+    row_vals = [ws.cell(row=row, column=c).value for c in range(1, num_cols + 1)]
+    if all(v is None or str(v).strip() == "" for v in row_vals):
+        return None
+    truck: dict = {"status": "scheduled"}
+    for field, idx in col_map.items():
+        v = row_vals[idx] if idx < len(row_vals) else None
+        if v is None or str(v).strip() == "":
+            continue
+        if field in ("grossWeight", "tareWeight", "netWeight"):
+            truck[field] = safe_float(v)
+        elif field == "fleetNo":
+            s = str(v).strip()
+            truck[field] = str(int(float(s))) if re.fullmatch(r'\d+(\.\d+)?', s) else s
+        else:
+            truck[field] = str(v).strip()
+    return truck if truck.get("vehicleReg") else None
+
+# --- Template 1: KFTS / Island View ---
+
+def _extract_kfts_template(ws) -> dict | None:
+    """
+    Row 1 — merged metadata: job reference + 'LOADED DD-MM-YYYY'
+    Row 2 — empty
+    Row 3 — column headers (TRANSPORTER, FLEET NO, HORSE REG, …)
+    Row 4+ — one truck per row; stops at first fully-empty row
+    """
+    row1_texts = _first_row_texts(ws, 1)
+    job_ref, destination, loaded_date = "", "", None
+    non_loaded: list[str] = []
+
+    for text in row1_texts:
+        # Always try to extract a LOADED date from this cell
+        m_date = re.search(r'LOADED\s+(\d{1,2}[-/]\d{1,2}[-/]\d{4})', text, re.IGNORECASE)
+        if m_date:
+            loaded_date = safe_date(m_date.group(1))
+            # Keep any text that isn't the LOADED clause (e.g. order ref in same cell)
+            remainder = re.sub(r'LOADED\s+\d{1,2}[-/]\d{1,2}[-/]\d{4}', '', text, flags=re.IGNORECASE).strip()
+            if remainder:
+                non_loaded.append(remainder)
+        else:
+            non_loaded.append(text)
+
+    # First non-LOADED cell → "ORDER_REF – DESTINATION"  or two separate cells
+    if non_loaded:
+        parts = re.split(r'\s*[–—]\s*|\s+-\s+', non_loaded[0], maxsplit=1)
+        job_ref = parts[0].strip()
+        if len(parts) > 1:
+            destination = parts[1].strip()
+        elif len(non_loaded) > 1:
+            # Client name is in its own cell right next to the order number
+            destination = non_loaded[1].strip()
+
+    headers = [str(ws.cell(row=3, column=c).value or "").strip() for c in range(1, ws.max_column + 1)]
+    col_map = _map_headers(headers)
+    if "vehicleReg" not in col_map:
+        return None
+
+    trucks = []
+    for row in range(4, ws.max_row + 1):
+        truck = _read_truck_row(ws, row, col_map, len(headers))
+        if truck is None:
+            break
+        truck["vehicleReg"] = truck["vehicleReg"].upper()
+        trucks.append(truck)
+
+    if not trucks:
+        return None
+
+    return {
+        "orderNumber": job_ref or None,
+        "destinationAddress": destination or None,
+        "clientName": destination or None,
+        "pickupDate": loaded_date,
+        "trucks": trucks,
+    }
+
+# --- Template 2: Bulk Connections standard download template ---
+
+def _extract_bulk_template(ws) -> dict | None:
+    """
+    Row 1  — title containing 'BULK CONNECTIONS'
+    Rows 3–9 — label | value order-info fields
+    Row 11 — column headers
+    Row 12+ — truck data
+    """
+    title = str(ws.cell(row=1, column=1).value or "")
+    if "BULK CONNECTIONS" not in title.upper():
+        return None
+
+    field_map = {
+        "ORDER NUMBER": "orderNumber",
+        "CLIENT": "clientName", "MINE": "clientName",
+        "PRODUCT": "product",
+        "QUANTITY": "orderQty", "TOTAL QUANTITY": "orderQty",
+        "ORIGIN": "originAddress",
+        "DESTINATION": "destinationAddress",
+        "PICKUP DATE": "pickupDate",
+    }
+    order_info: dict = {}
+    for row in range(3, 10):
+        label = str(ws.cell(row=row, column=1).value or "").strip().upper().rstrip(":")
+        value = ws.cell(row=row, column=2).value
+        if not label or not value:
+            continue
+        for key, fld in field_map.items():
+            if key in label:
+                order_info[fld] = str(value).strip()
+                break
+
+    headers = [str(ws.cell(row=11, column=c).value or "").strip() for c in range(1, ws.max_column + 1)]
+    col_map = _map_headers(headers)
+    if "vehicleReg" not in col_map:
+        return None
+
+    trucks = []
+    for row in range(12, ws.max_row + 1):
+        truck = _read_truck_row(ws, row, col_map, len(headers))
+        if truck is None:
+            break
+        truck["vehicleReg"] = truck["vehicleReg"].upper()
+        trucks.append(truck)
+
+    if not trucks:
+        return None
+
+    result = {**order_info, "trucks": trucks}
+    if "pickupDate" in result:
+        result["pickupDate"] = safe_date(result["pickupDate"])
+    if "orderQty" in result:
+        result["orderQty"] = safe_float(result["orderQty"])
+    return result
+
+# --- Template 3: Generic auto-detect ---
+
+def _extract_generic_template(ws) -> dict | None:
+    """
+    Scan first 15 rows for a header row that contains a vehicle-reg column,
+    then extract all data rows below it.
+    """
+    vehicle_kws = {"HORSE REG", "VEHICLE REG", "HORSE", "TRUCK REG"}
+    header_row = None
+    for row in range(1, min(16, ws.max_row + 1)):
+        vals = {str(ws.cell(row=row, column=c).value or "").strip().upper()
+                for c in range(1, ws.max_column + 1)}
+        if vals & vehicle_kws:
+            header_row = row
+            break
+    if not header_row:
+        return None
+
+    headers = [str(ws.cell(row=header_row, column=c).value or "").strip()
+               for c in range(1, ws.max_column + 1)]
+    col_map = _map_headers(headers)
+    if "vehicleReg" not in col_map:
+        return None
+
+    trucks = []
+    empty_streak = 0
+    row = header_row + 1
+    while row <= ws.max_row and empty_streak < 3:
+        truck = _read_truck_row(ws, row, col_map, len(headers))
+        if truck is None:
+            empty_streak += 1
+        else:
+            empty_streak = 0
+            truck["vehicleReg"] = truck["vehicleReg"].upper()
+            trucks.append(truck)
+        row += 1
+
+    return {"trucks": trucks} if trucks else None
+
+# --- Dispatcher ---
+
+def extract_excel_structured(file_bytes: bytes) -> dict | None:
+    """
+    Try each template in priority order; return the first match or None.
+    None signals the caller to fall back to Gemini AI.
+    """
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
+        ws = wb.active
+
+        for extractor, name in [
+            (_extract_kfts_template,    "KFTS / Island View"),
+            (_extract_bulk_template,    "Bulk Connections standard"),
+            (_extract_generic_template, "Generic auto-detect"),
+        ]:
+            result = extractor(ws)
+            if result:
+                logger.info(f"Excel matched '{name}' template — "
+                            f"{len(result.get('trucks', []))} trucks, order={result.get('orderNumber')}")
+                return result
+
+        logger.info("No Excel template matched — falling back to Gemini AI")
+        return None
+    except Exception as e:
+        logger.error(f"Structured Excel extraction error: {e}")
+        return None
+
+# ============================================
+# EXCEL UPLOAD — TEMPLATE ENGINE + GEMINI AI
 # ============================================
 
 def excel_to_text(file_bytes: bytes) -> str:
-    """Convert all sheets of an Excel file to readable text for Gemini."""
+    """Convert all sheets of an Excel file to readable text (Gemini fallback)."""
     try:
         xl = pd.ExcelFile(io.BytesIO(file_bytes))
         parts = []
@@ -515,7 +909,7 @@ def excel_to_text(file_bytes: bytes) -> str:
 
 @app.post("/api/upload/excel")
 async def upload_excel(file: UploadFile = File(...)):
-    """Upload Excel file — Gemini AI extraction."""
+    """Upload Excel file — template extraction with Gemini AI fallback."""
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not connected")
 
@@ -523,19 +917,24 @@ async def upload_excel(file: UploadFile = File(...)):
     try:
         contents = await file.read()
 
-        # Convert Excel → readable text
-        excel_text = excel_to_text(contents)
-        if not excel_text.strip():
-            raise HTTPException(status_code=400, detail="Could not read Excel file")
+        # Step 1: Try structured template extraction (openpyxl)
+        extracted = extract_excel_structured(contents)
 
-        logger.info(f"Excel text ({len(excel_text)} chars):\n{excel_text[:500]}")
-
-        # Gemini AI extraction
-        extracted = call_gemini(excel_text)
+        # Step 2: Fall back to Gemini AI if no template matched
         if not extracted:
-            raise HTTPException(status_code=422, detail="AI could not parse the Excel content. Try downloading and using the provided template.")
+            excel_text = excel_to_text(contents)
+            if not excel_text.strip():
+                raise HTTPException(status_code=400, detail="Could not read Excel file")
+            logger.info(f"Gemini fallback — Excel text ({len(excel_text)} chars):\n{excel_text[:500]}")
+            extracted = call_gemini(excel_text)
 
-        # Save to database
+        if not extracted:
+            raise HTTPException(
+                status_code=422,
+                detail="Could not parse Excel. Ensure the file matches a supported format or use the provided template.",
+            )
+
+        # Step 3: Save to database
         summary = save_extracted_to_db(extracted, file.filename)
 
         return {
@@ -660,6 +1059,105 @@ async def download_excel_template():
         )
     except Exception as e:
         logger.error(f"Template generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================
+# EXCEL REPORT — REAL DATA FROM DATABASE
+# ============================================
+
+@app.get("/api/report/excel/{order_id}")
+async def download_order_report(order_id: str):
+    """Generate a filled KFTS-style Excel report for an order using live DB data."""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not connected")
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        order_res = supabase.table("orders").select("*").eq("id", order_id).execute()
+        if not order_res.data:
+            raise HTTPException(status_code=404, detail="Order not found")
+        order = order_res.data[0]
+
+        trucks_res = supabase.table("truck_allocations").select("*").eq("orderId", order_id).execute()
+        trucks = trucks_res.data or []
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+
+        order_number = order.get("orderNumber", "")
+        destination = order.get("destinationAddress") or order.get("clientName") or ""
+        pickup_date = order.get("requestedPickupDate", "") or ""
+
+        header_fill = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        alt_fill = PatternFill(start_color="F0F4FA", end_color="F0F4FA", fill_type="solid")
+        thin = Side(style="thin", color="CCCCCC")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        center = Alignment(horizontal="center", vertical="center")
+
+        # Row 1: KFTS-style metadata (job ref left, loaded date right)
+        row1_left = f"{order_number} – {destination}".strip(" –")
+        row1_right = f"LOADED {pickup_date}" if pickup_date else "LOADED —"
+
+        ws.merge_cells("A1:D1")
+        ws["A1"] = row1_left
+        ws["A1"].font = Font(bold=True, size=12, color="1E3A5F")
+
+        ws.merge_cells("E1:G1")
+        ws["E1"] = row1_right
+        ws["E1"].font = Font(bold=True, size=12, color="1E3A5F")
+        ws["E1"].alignment = Alignment(horizontal="right", vertical="center")
+        ws.row_dimensions[1].height = 24
+
+        # Row 3: column headers
+        col_headers = ["TRANSPORTER", "FLEET NO", "HORSE REG", "TRAILER 1", "TRAILER 2", "DRIVER NAME SURNAME", "ID"]
+        for col, h in enumerate(col_headers, start=1):
+            cell = ws.cell(row=3, column=col, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+            cell.border = border
+        ws.row_dimensions[3].height = 22
+
+        # Rows 4+: truck data from DB
+        for row_idx, truck in enumerate(trucks, start=4):
+            row_data = [
+                truck.get("transporter", ""),
+                truck.get("fleetNo", ""),
+                truck.get("vehicleReg", ""),
+                truck.get("trailer1", ""),
+                truck.get("trailer2", ""),
+                truck.get("driverName", ""),
+                truck.get("driverId", ""),
+            ]
+            fill = alt_fill if row_idx % 2 == 0 else None
+            for col, val in enumerate(row_data, start=1):
+                cell = ws.cell(row=row_idx, column=col, value=val)
+                cell.border = border
+                if fill:
+                    cell.fill = fill
+            ws.row_dimensions[row_idx].height = 18
+
+        for col, width in enumerate([22, 12, 14, 12, 12, 26, 18], start=1):
+            ws.column_dimensions[get_column_letter(col)].width = width
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        safe_num = re.sub(r'[^\w\-]', '_', order_number) or order_id[:8]
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={safe_num}_report.xlsx"},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Report generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Truck } from "lucide-react";
+import { loginUser } from "@/lib/api";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
@@ -11,34 +12,25 @@ export default function LoginPage() {
   const [error, setError] = useState("");
   const router = useRouter();
 
-  // Hardcoded test accounts
-  const testAccounts = [
-    { email: "yatish@test.com", password: "password1234!", name: "Yatish", role: "client" },
-    { email: "admin@test.com", password: "password1234!", name: "Admin", role: "admin" }
-  ];
-
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError("");
 
-    // Check if credentials match any test account
-    const user = testAccounts.find(
-      u => u.email === email && u.password === password
-    );
-
-    if (user) {
-      // Store user in localStorage
+    try {
+      const user = await loginUser(email.trim().toLowerCase(), password);
       localStorage.setItem("user", JSON.stringify({
+        id: user.id,
         email: user.email,
         name: user.name,
-        role: user.role
+        role: user.role,
       }));
       router.push("/dashboard");
-    } else {
-      setError("Invalid email or password");
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Invalid email or password");
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   return (
@@ -66,7 +58,7 @@ export default function LoginPage() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 className="appearance-none block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-                placeholder="yatish@test.com"
+                placeholder="you@example.com"
               />
             </div>
           </div>
@@ -85,7 +77,6 @@ export default function LoginPage() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="appearance-none block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-                placeholder="password1234!"
               />
             </div>
           </div>
@@ -107,13 +98,6 @@ export default function LoginPage() {
           </div>
         </form>
 
-        <div className="mt-6 pt-6 border-t border-gray-200">
-          <p className="text-xs text-gray-500 text-center">
-            Demo Credentials:<br />
-            Email: yatish@test.com<br />
-            Password: password1234!
-          </p>
-        </div>
       </div>
     </div>
   );

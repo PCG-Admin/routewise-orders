@@ -4,7 +4,7 @@ supabase
 python-multipart
 openpyxl
 pandas
-google-generativeai
+google-genai
 PyPDF2
 pdf2image
 pytesseract
