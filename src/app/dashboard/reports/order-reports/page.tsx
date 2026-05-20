@@ -4,7 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
 import { Download, Search, ChevronLeft, ChevronRight } from 'lucide-react';
 
-const API_URL = 'https://bulk-01.onrender.com';
+const API_URL = 'https://bulk-01-1-docker.onrender.com';
 const COLORS = ['#1E3A8A', '#7E22CE', '#A855F7', '#3B82F6', '#0EA5E9', '#0284C7', '#475569', '#64748B', '#334155', '#22C55E'];
 
 interface ClientStat {

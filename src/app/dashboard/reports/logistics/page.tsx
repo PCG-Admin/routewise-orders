@@ -4,7 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { Search } from 'lucide-react';
 
-const API_URL = 'https://bulk-01.onrender.com';
+const API_URL = 'https://bulk-01-1-docker.onrender.com';
 
 interface TransporterStat {
   name: string;
