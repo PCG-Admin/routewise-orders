@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: bulk-connections-backend
+    runtime: docker
+    repo: https://github.com/Alisonrajpal/bulk-01
+    plan: free
+    dockerfilePath: ./backend/Dockerfile
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        value: https://bulk-01.vercel.app,http://localhost:3000
