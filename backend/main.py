@@ -488,6 +488,7 @@ def extract_pdf_via_ocr(file_bytes: bytes) -> str:
         from pdf2image import convert_from_bytes  # type: ignore[import]
         import pytesseract  # type: ignore[import]
         from PIL import Image  # type: ignore[import]
+        pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
 
         images = convert_from_bytes(file_bytes, dpi=300)
         logger.info(f"pdf2image: {len(images)} page(s)")

@@ -5,6 +5,7 @@ services:
     repo: https://github.com/Alisonrajpal/bulk-01
     plan: free
     dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
     envVars:
       - key: SUPABASE_URL
         sync: false
