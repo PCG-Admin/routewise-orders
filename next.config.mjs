@@ -13,7 +13,7 @@ const nextConfig = {
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data: blob:",
               "font-src 'self'",
-              "connect-src 'self' https://bulk-01.onrender.com",
+              "connect-src 'self' https://bulk-01-1-docker.onrender.com",
               "frame-ancestors 'none'",
             ].join('; '),
           },
