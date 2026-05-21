@@ -22,8 +22,7 @@ import {
 } from "lucide-react";
 
 // API Service
-const API_URL = 'https://bulk-01-1-docker.onrender.com';
-
+const API_URL = 'YOUR_API_URL'
 interface Order {
   id: string;
   orderNumber: string;

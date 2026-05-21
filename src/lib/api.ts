@@ -1,5 +1,5 @@
 // API service for backend calls
-const API_URL = 'https://bulk-01-1-docker.onrender.com'; // Your FastAPI backend
+const API_URL = 'YOUR_API_URL'; // Your FastAPI backend
 
 export async function loginUser(email: string, password: string) {
     const response = await fetch(`${API_URL}/api/auth/login`, {
