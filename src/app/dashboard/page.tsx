@@ -5,7 +5,6 @@ import {
   Download,
   Plus,
   Package,
-  Clock,
   Truck,
   CheckSquare,
   AlertCircle,
@@ -1028,17 +1027,8 @@ export default function DashboardPage() {
 
                   <div className="flex items-start gap-2 mt-4 text-xs sm:text-sm text-blue-700 bg-blue-50 p-3 rounded-lg border border-blue-100">
                     <Info className="w-4 h-4 sm:w-5 sm:h-5 shrink-0 mt-0.5" />
-                    <p>AI automatically extracts all data from PDF weighbridge reports and Excel files. Use the template below for best Excel results.</p>
+                    <p>AI automatically extracts all data from PDF weighbridge reports and Excel files.</p>
                   </div>
-
-                  <a
-                    href={`${API_URL}/api/template/excel`}
-                    download="truck_allocation_template.xlsx"
-                    className="mt-3 flex items-center justify-center gap-2 w-full px-4 py-2.5 border border-emerald-200 bg-emerald-50 text-emerald-700 rounded-xl text-sm font-semibold hover:bg-emerald-100 transition-all"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download Excel Template
-                  </a>
                 </div>
 
                 {uploadResult && (

@@ -465,85 +465,137 @@ def call_gemini(text: str) -> dict | None:
         logger.error(f"Gemini text call failed: {e}")
         return None
 
+
 # ============================================
-# PDF UPLOAD — GEMINI NATIVE + IMAGE OCR + TEXT FALLBACK
+# PDF UPLOAD — PyPDF2 → OCR FALLBACK → GEMINI 2.5 FLASH
 # ============================================
 
-def _pdf_text_pypdf2(file_bytes: bytes) -> str:
-    """Extract text from a PDF using PyPDF2."""
+def _pdf_extract_text_pypdf2(file_bytes: bytes) -> str:
+    """Extract text from a PDF using PyPDF2. Returns empty string on failure."""
     try:
         reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-        parts = [p for page in reader.pages if (p := page.extract_text())]
-        return "\n".join(parts)
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text()
+            if text and text.strip():
+                pages.append(text)
+        result = "\n".join(pages)
+        logger.info(f"PyPDF2 extracted {len(result)} characters from {len(reader.pages)} page(s)")
+        return result
     except Exception as e:
-        logger.error(f"PyPDF2 error: {e}")
+        logger.error(f"PyPDF2 extraction error: {e}")
         return ""
 
-def extract_pdf_via_ocr(file_bytes: bytes) -> str:
+
+def _pdf_extract_text_ocr(file_bytes: bytes) -> str:
     """
-    Convert PDF pages to images with pdf2image + Pillow, then run pytesseract OCR.
-    Returns the full extracted text across all pages.
+    OCR fallback: convert each PDF page to a 300 DPI greyscale image with
+    pdf2image, then run pytesseract. Returns combined text or empty string.
     """
     try:
+        import shutil
         from pdf2image import convert_from_bytes  # type: ignore[import]
-        import pytesseract  # type: ignore[import]
-        from PIL import Image  # type: ignore[import]
-        pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", "/usr/bin/tesseract")
+        import pytesseract                         # type: ignore[import]
+        from PIL import Image                      # type: ignore[import]
+
+        # Locate Tesseract binary (env var → known Windows paths → PATH)
+        tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+        if not (tesseract_cmd and os.path.isfile(tesseract_cmd)):
+            candidates = [
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+                shutil.which("tesseract") or "",
+            ]
+            tesseract_cmd = next((p for p in candidates if p and os.path.isfile(p)), "")
+
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+            logger.info(f"Tesseract binary: {tesseract_cmd}")
+        else:
+            logger.warning("Tesseract binary not found — OCR unavailable")
+            return ""
 
         images = convert_from_bytes(file_bytes, dpi=300)
-        logger.info(f"pdf2image: {len(images)} page(s)")
-        parts = []
+        logger.info(f"pdf2image: {len(images)} page(s) at 300 DPI")
+
+        pages = []
         for i, img in enumerate(images, start=1):
-            gray = img.convert("L")
-            text = pytesseract.image_to_string(gray, config="--psm 6 --oem 3")
+            grey = img.convert("L")
+            text = pytesseract.image_to_string(grey, config="--psm 6 --oem 3 -l eng")
             if text.strip():
-                parts.append(f"--- PAGE {i} ---\n{text}")
-                logger.info(f"Page {i} OCR: {len(text)} chars")
-        result = "\n".join(parts)
-        logger.info(f"Total OCR text: {len(result)} chars")
+                pages.append(f"--- PAGE {i} ---\n{text}")
+                logger.info(f"OCR page {i}: {len(text)} chars")
+
+        result = "\n".join(pages)
+        logger.info(f"OCR total: {len(result)} chars")
         return result
+
     except ImportError as e:
-        logger.warning(f"OCR library missing ({e}) — skipping OCR path")
+        logger.warning(f"OCR dependency missing: {e}")
         return ""
     except Exception as e:
-        logger.error(f"OCR extraction error: {e}")
+        logger.error(f"OCR error: {e}")
         return ""
+
 
 @app.post("/api/upload/pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     """
     Upload a weighbridge / WDR PDF.
-    Pipeline: pdf2image + pytesseract OCR → Gemini Flash 2.5 extraction.
-    Fallback: PyPDF2 text → Gemini Flash 2.5.
+    Pipeline:
+      1. PyPDF2  — fast text extraction for digital PDFs
+      2. OCR     — pdf2image + pytesseract when PyPDF2 yields < 200 chars
+      3. Gemini 2.5 Flash — structured data extraction from the text
+      4. Supabase — save order + truck allocations
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not connected")
 
-    logger.info(f"PDF upload: {file.filename}")
+    logger.info(f"PDF upload started: {file.filename}")
     try:
         contents = await file.read()
-        extracted = None
 
-        # Step 1 — pdf2image + pytesseract OCR → Gemini Flash 2.5
-        ocr_text = extract_pdf_via_ocr(contents)
-        if ocr_text.strip():
-            logger.info(f"OCR text ({len(ocr_text)} chars) → Gemini Flash 2.5")
-            extracted = call_gemini(ocr_text)
+        # ── Step 1: PyPDF2 text extraction ────────────────────────────────
+        pdf_text = _pdf_extract_text_pypdf2(contents)
 
-        # Step 2 — PyPDF2 text → Gemini Flash 2.5 (fallback for digital PDFs)
-        if not extracted:
-            logger.info("OCR empty — falling back to PyPDF2 text extraction")
-            pdf_text = _pdf_text_pypdf2(contents)
-            if pdf_text.strip():
-                logger.info(f"PyPDF2 text ({len(pdf_text)} chars) → Gemini Flash 2.5")
-                extracted = call_gemini(pdf_text)
+        # ── Step 2: OCR fallback when PyPDF2 yields too little text ───────
+        if len(pdf_text.strip()) < 200:
+            logger.info(
+                f"PyPDF2 returned only {len(pdf_text.strip())} chars — falling back to OCR"
+            )
+            ocr_text = _pdf_extract_text_ocr(contents)
+            if ocr_text.strip():
+                pdf_text = ocr_text
 
+        if not pdf_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Could not extract text from this PDF. "
+                    "For scanned PDFs, ensure Tesseract OCR is installed on the server."
+                ),
+            )
+
+        logger.info(f"Text ready for Gemini: {len(pdf_text)} chars")
+
+        # ── Step 3: Gemini 2.5 Flash structured extraction ────────────────
+        extracted = call_gemini(pdf_text)
         if not extracted:
             raise HTTPException(
                 status_code=422,
-                detail="Could not parse this PDF. Ensure it is a Newton weighbridge report (WDR) or a supported order document.",
+                detail=(
+                    "Gemini could not parse this PDF. "
+                    "Ensure it is a Newton weighbridge report (WDR) or similar order document."
+                ),
             )
 
+        trucks_found = len(extracted.get("trucks", []))
+        logger.info(
+            f"Gemini extracted: order={extracted.get('orderNumber')}, trucks={trucks_found}"
+        )
+
+        # ── Step 4: Save to Supabase ───────────────────────────────────────
         summary = save_extracted_to_db(extracted, file.filename)
         return {
             "success": True,
@@ -758,15 +810,24 @@ def _extract_kfts_template(ws) -> dict | None:
         else:
             non_loaded.append(text)
 
-    # First non-LOADED cell → "ORDER_REF – DESTINATION"  or two separate cells
+    # First non-LOADED cell → "ORDER_REF – DESTINATION", "ORDER_REF COMPANY NAME", or two separate cells
     if non_loaded:
         parts = re.split(r'\s*[–—]\s*|\s+-\s+', non_loaded[0], maxsplit=1)
-        job_ref = parts[0].strip()
         if len(parts) > 1:
+            # Separated by dash/em-dash: "VRC26-05-001 – Island View"
+            job_ref = parts[0].strip()
             destination = parts[1].strip()
-        elif len(non_loaded) > 1:
-            # Client name is in its own cell right next to the order number
-            destination = non_loaded[1].strip()
+        else:
+            # No dash separator — if first space-delimited token contains digits it's the order code
+            # e.g. "VRC26-05-001 NORTHAM ELAND" → order="VRC26-05-001", company="NORTHAM ELAND"
+            m_ref = re.match(r'^(\S+)\s+(.+)', non_loaded[0])
+            if m_ref and re.search(r'\d', m_ref.group(1)):
+                job_ref = m_ref.group(1).strip()
+                destination = m_ref.group(2).strip()
+            else:
+                job_ref = parts[0].strip()
+                if len(non_loaded) > 1:
+                    destination = non_loaded[1].strip()
 
     headers = [str(ws.cell(row=3, column=c).value or "").strip() for c in range(1, ws.max_column + 1)]
     col_map = _map_headers(headers)
@@ -887,6 +948,63 @@ def _extract_generic_template(ws) -> dict | None:
 
     return {"trucks": trucks} if trucks else None
 
+# --- Row-1 order info extractor (used as fallback by all templates) ---
+
+def _extract_row1_order_info(ws) -> dict:
+    """
+    Scan row 1 of the worksheet and extract orderNumber, clientName, pickupDate.
+    Expected format (all in one cell or spread across cells):
+        ORDER_CODE  COMPANY NAME  LOADED DD-MM-YYYY
+    Returns a dict with whichever fields were found (may be empty).
+    """
+    texts = _first_row_texts(ws, 1)
+    combined = " ".join(texts).strip()
+    result: dict = {}
+
+    if not combined:
+        return result
+
+    # --- Extract LOADED date (DD-MM-YYYY, DD/MM/YYYY, YYYY-MM-DD, DD-MM-YY) ---
+    date_patterns = [
+        r'LOADED\s+(\d{1,2}[-/]\d{1,2}[-/]\d{4})',   # DD-MM-YYYY or DD/MM/YYYY
+        r'LOADED\s+(\d{4}[-/]\d{2}[-/]\d{2})',         # YYYY-MM-DD
+        r'LOADED\s+(\d{1,2}[-/]\d{1,2}[-/]\d{2})\b',  # DD-MM-YY (2-digit year)
+    ]
+    for pat in date_patterns:
+        m = re.search(pat, combined, re.IGNORECASE)
+        if m:
+            d = safe_date(m.group(1))
+            if d:
+                result["pickupDate"] = d
+            combined = re.sub(pat, '', combined, flags=re.IGNORECASE).strip()
+            break
+
+    combined = re.sub(r'\s+', ' ', combined).strip()
+    if not combined:
+        return result
+
+    # --- Extract order number and company name ---
+    # Try explicit dash/em-dash separator first: "VRC26-05-001 – NORTHAM ELAND"
+    parts = re.split(r'\s*[–—]\s*|\s+-\s+', combined, maxsplit=1)
+    if len(parts) > 1:
+        result["orderNumber"] = parts[0].strip()
+        result["clientName"] = parts[1].strip()
+    else:
+        # No dash — first non-space token that contains digits is the order code;
+        # everything after the first space is the company name.
+        # e.g. "VRC26-05-001 NORTHAM ELAND" → order="VRC26-05-001" company="NORTHAM ELAND"
+        m_ref = re.match(r'^(\S+)\s+(.+)', combined)
+        if m_ref and re.search(r'\d', m_ref.group(1)):
+            result["orderNumber"] = m_ref.group(1).strip()
+            result["clientName"] = m_ref.group(2).strip()
+        else:
+            # Only one token present — treat as order number
+            result["orderNumber"] = combined.strip()
+
+    logger.info(f"Row-1 order info: {result}")
+    return result
+
+
 # --- Dispatcher ---
 
 def extract_excel_structured(file_bytes: bytes) -> dict | None:
@@ -906,6 +1024,13 @@ def extract_excel_structured(file_bytes: bytes) -> dict | None:
         ]:
             result = extractor(ws)
             if result:
+                # Fill any missing order metadata from row 1
+                # (generic template returns trucks only; KFTS may also miss if row 1 format is unusual)
+                if not result.get("orderNumber") or not result.get("clientName") or not result.get("pickupDate"):
+                    row1 = _extract_row1_order_info(ws)
+                    for key in ("orderNumber", "clientName", "pickupDate"):
+                        if not result.get(key) and row1.get(key):
+                            result[key] = row1[key]
                 logger.info(f"Excel matched '{name}' template — "
                             f"{len(result.get('trucks', []))} trucks, order={result.get('orderNumber')}")
                 return result
