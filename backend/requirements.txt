@@ -6,6 +6,7 @@ openpyxl
 pandas
 google-genai>=1.0.0
 PyPDF2
+pdfplumber
 pdf2image
 pytesseract
 pillow

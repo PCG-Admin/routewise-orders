@@ -12,7 +12,7 @@ import re
 import logging
 
 from utils import safe_date, safe_float
-from pdf_extractor import extract_pdf_text
+from pdf_extractor import extract_pdf_text, parse_wdr_text
 from excel_extractor import extract_excel_structured, excel_to_text
 
 logging.basicConfig(level=logging.INFO)
@@ -455,11 +455,14 @@ def call_gemini(text: str) -> dict | None:
 async def upload_pdf(file: UploadFile = File(...)):
     """
     Upload a weighbridge / WDR PDF.
+
     Pipeline:
-      1. PyPDF2  — fast text extraction for digital PDFs
-      2. OCR     — pdf2image + pytesseract when PyPDF2 yields < 200 chars
-      3. Gemini 2.5 Flash — structured data extraction from the text
-      4. Supabase — save order + truck allocations
+      1. Text Extraction  — pdfplumber → PyPDF2 → Tesseract OCR
+      2. Line Detection   — scan extracted text for DISP transaction rows
+      3. Regex Parsing    — parse each matched row into truck fields
+      4. Structured JSON  — if regex found trucks, use directly (no Gemini needed)
+      5. Gemini Fallback  — if regex yields nothing, send text to Gemini 2.5 Flash
+      6. Supabase         — save order + truck allocations
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not connected")
@@ -468,7 +471,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     try:
         contents = await file.read()
 
-        # ── Steps 1 & 2: PyPDF2 → OCR fallback (handled in pdf_extractor) ─
+        # ── Step 1: Text Extraction ───────────────────────────────────────
         pdf_text = extract_pdf_text(contents)
 
         if not pdf_text.strip():
@@ -480,25 +483,34 @@ async def upload_pdf(file: UploadFile = File(...)):
                 ),
             )
 
-        logger.info(f"Text ready for Gemini: {len(pdf_text)} chars")
+        logger.info(f"Extracted {len(pdf_text)} chars — running regex parser")
 
-        # ── Step 3: Gemini 2.5 Flash structured extraction ────────────────
-        extracted = call_gemini(pdf_text)
-        if not extracted:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "Gemini could not parse this PDF. "
-                    "Ensure it is a Newton weighbridge report (WDR) or similar order document."
-                ),
+        # ── Steps 2-4: Line Detection → Regex Parsing → Structured JSON ──
+        extracted = parse_wdr_text(pdf_text)
+
+        if extracted and extracted.get("trucks"):
+            logger.info(
+                f"Regex parser succeeded: order={extracted.get('orderNumber')}, "
+                f"trucks={len(extracted['trucks'])}"
+            )
+        else:
+            # ── Step 5: Gemini 2.5 Flash fallback ─────────────────────────
+            logger.info("Regex parser found no trucks — falling back to Gemini")
+            extracted = call_gemini(pdf_text)
+            if not extracted:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Could not parse this PDF. "
+                        "Ensure it is a Newton weighbridge report (WDR) or similar order document."
+                    ),
+                )
+            logger.info(
+                f"Gemini extracted: order={extracted.get('orderNumber')}, "
+                f"trucks={len(extracted.get('trucks', []))}"
             )
 
-        trucks_found = len(extracted.get("trucks", []))
-        logger.info(
-            f"Gemini extracted: order={extracted.get('orderNumber')}, trucks={trucks_found}"
-        )
-
-        # ── Step 4: Save to Supabase ───────────────────────────────────────
+        # ── Step 6: Save to Supabase ──────────────────────────────────────
         summary = save_extracted_to_db(extracted, file.filename)
         return {
             "success": True,
