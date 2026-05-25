@@ -22,7 +22,7 @@ import {
 } from "lucide-react";
 
 // API Service
-const API_URL = 'YOUR_API_URL'
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 interface Order {
   id: string;
   orderNumber: string;
