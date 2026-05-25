@@ -12,7 +12,7 @@ import re
 import logging
 
 from utils import safe_date, safe_float
-from pdf_extractor import extract_pdf_text, parse_wdr_text
+from pdf_extractor import extract_pdf_text, parse_wdr_text, extract_with_vision_ocr
 from excel_extractor import extract_excel_structured, excel_to_text
 
 logging.basicConfig(level=logging.INFO)
@@ -446,23 +446,72 @@ def call_gemini(text: str) -> dict | None:
         logger.error(f"Gemini text call failed: {e}")
         return None
 
+def call_gemini_vision(images: list) -> dict | None:
+    """
+    Send preprocessed PDF page images directly to Gemini 2.5 Flash Vision.
+    Used when OCR text is too garbled for the regex parser to match.
+    Returns parsed dict or None.
+    """
+    if not gemini_client or not images:
+        return None
+    try:
+        from google.genai import types as _genai_types  # type: ignore[import]
+
+        contents = []
+        for img in images[:4]:   # cap at 4 pages to avoid token limits
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            contents.append(
+                _genai_types.Part.from_bytes(
+                    data=buf.getvalue(), mime_type="image/png"
+                )
+            )
+        # Reuse the same structured extraction prompt
+        contents.append(
+            GEMINI_PROMPT +
+            "\nExtract all transaction rows and order metadata visible in these document images."
+        )
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+        )
+        result = _parse_gemini_response(response.text)
+        if result:
+            logger.info(
+                f"Gemini Vision extracted: order={result.get('orderNumber')}, "
+                f"trucks={len(result.get('trucks', []))}"
+            )
+        return result
+    except Exception as e:
+        logger.error(f"Gemini Vision call failed: {e}")
+        return None
+
 
 # ============================================
-# PDF UPLOAD — PyPDF2 → OCR FALLBACK → GEMINI 2.5 FLASH
+# PDF UPLOAD
 # ============================================
 
 @app.post("/api/upload/pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     """
-    Upload a weighbridge / WDR PDF.
+    Upload a transport / weighbridge PDF.
 
-    Pipeline:
-      1. Text Extraction  — pdfplumber → PyPDF2 → Tesseract OCR
-      2. Line Detection   — scan extracted text for DISP transaction rows
-      3. Regex Parsing    — parse each matched row into truck fields
-      4. Structured JSON  — if regex found trucks, use directly (no Gemini needed)
-      5. Gemini Fallback  — if regex yields nothing, send text to Gemini 2.5 Flash
-      6. Supabase         — save order + truck allocations
+    Pipeline (each stage only runs if the previous one found no trucks):
+
+      1. Text Extraction   pdfplumber → PyPDF2 → basic Tesseract OCR
+         ↓
+      2. Regex Parsing     Line detection → regex → structured JSON  (fast, no API)
+         ↓ (if no trucks)
+      3. Vision OCR        PDF page → image → crop → preprocess → Tesseract OCR
+         ↓
+      4. Regex on OCR      Same regex parser on the enhanced OCR text
+         ↓ (if still no trucks)
+      5. Gemini Vision     Preprocessed images → Gemini 2.5 Flash Vision
+         ↓ (if still no trucks)
+      6. Gemini Text       Extracted text → Gemini 2.5 Flash  (final fallback)
+         ↓
+      7. Supabase          Save order + truck allocations
     """
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not connected")
@@ -471,46 +520,55 @@ async def upload_pdf(file: UploadFile = File(...)):
     try:
         contents = await file.read()
 
-        # ── Step 1: Text Extraction ───────────────────────────────────────
+        # ── Stage 1: Text extraction ──────────────────────────────────────
         pdf_text = extract_pdf_text(contents)
+        logger.info(f"Text extraction: {len(pdf_text)} chars")
 
-        if not pdf_text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Could not extract text from this PDF. "
-                    "For scanned PDFs, ensure Tesseract OCR is installed on the server."
-                ),
-            )
-
-        logger.info(f"Extracted {len(pdf_text)} chars — running regex parser")
-
-        # ── Steps 2-4: Line Detection → Regex Parsing → Structured JSON ──
-        extracted = parse_wdr_text(pdf_text)
-
+        # ── Stage 2: Regex parsing ────────────────────────────────────────
+        extracted = parse_wdr_text(pdf_text) if pdf_text.strip() else None
         if extracted and extracted.get("trucks"):
             logger.info(
                 f"Regex parser succeeded: order={extracted.get('orderNumber')}, "
                 f"trucks={len(extracted['trucks'])}"
             )
         else:
-            # ── Step 5: Gemini 2.5 Flash fallback ─────────────────────────
-            logger.info("Regex parser found no trucks — falling back to Gemini")
-            extracted = call_gemini(pdf_text)
-            if not extracted:
+            logger.info("Regex found no trucks — starting vision OCR pipeline")
+
+            # ── Stage 3: Vision OCR (image preprocessing + Tesseract) ────
+            ocr_text, page_images = extract_with_vision_ocr(contents)
+
+            # ── Stage 4: Regex on enhanced OCR text ──────────────────────
+            if ocr_text.strip():
+                extracted = parse_wdr_text(ocr_text)
+                if extracted and extracted.get("trucks"):
+                    logger.info(
+                        f"Regex on vision OCR succeeded: "
+                        f"order={extracted.get('orderNumber')}, "
+                        f"trucks={len(extracted['trucks'])}"
+                    )
+
+            # ── Stage 5: Gemini Vision (images → Gemini) ─────────────────
+            if not (extracted and extracted.get("trucks")) and page_images:
+                logger.info("Regex on OCR found no trucks — trying Gemini Vision")
+                extracted = call_gemini_vision(page_images)
+
+            # ── Stage 6: Gemini text fallback ─────────────────────────────
+            if not (extracted and extracted.get("trucks")):
+                best_text = ocr_text if len(ocr_text) > len(pdf_text) else pdf_text
+                if best_text.strip():
+                    logger.info("Gemini Vision found no trucks — trying Gemini text")
+                    extracted = call_gemini(best_text)
+
+            if not (extracted and extracted.get("trucks")):
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "Could not parse this PDF. "
-                        "Ensure it is a Newton weighbridge report (WDR) or similar order document."
+                        "Could not extract truck data from this PDF. "
+                        "Ensure it is a valid transport or weighbridge order document."
                     ),
                 )
-            logger.info(
-                f"Gemini extracted: order={extracted.get('orderNumber')}, "
-                f"trucks={len(extracted.get('trucks', []))}"
-            )
 
-        # ── Step 6: Save to Supabase ──────────────────────────────────────
+        # ── Stage 7: Save to Supabase ─────────────────────────────────────
         summary = save_extracted_to_db(extracted, file.filename)
         return {
             "success": True,

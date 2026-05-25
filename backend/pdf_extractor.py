@@ -154,6 +154,101 @@ def extract_text_ocr(file_bytes: bytes) -> str:
         return ""
 
 
+# ── Stage 4: Enhanced vision OCR (image preprocessing pipeline) ──────────────
+
+def extract_with_vision_ocr(file_bytes: bytes) -> tuple[str, list]:
+    """
+    High-quality image processing pipeline for when standard text extraction
+    produces text too garbled for the regex parser.
+
+    Pipeline:
+      PDF page  →  Convert to image (400 DPI)
+                →  Crop receipt area (trim margins)
+                →  Greyscale + contrast enhance
+                →  Sharpen
+                →  Otsu threshold (clean black/white)
+                →  Tesseract OCR
+                →  Field extraction ready text
+
+    Returns:
+      (ocr_text, pil_images)
+      ocr_text   — combined text from all pages (empty str on failure)
+      pil_images — preprocessed PIL images for Gemini Vision fallback
+    """
+    pil_images: list = []
+    ocr_parts: list[str] = []
+
+    try:
+        from pdf2image import convert_from_bytes  # type: ignore[import]
+        from PIL import Image, ImageEnhance, ImageFilter  # type: ignore[import]
+
+        raw_images = convert_from_bytes(file_bytes, dpi=400)
+        logger.info(f"Vision OCR: {len(raw_images)} page(s) at 400 DPI")
+
+        for i, img in enumerate(raw_images, start=1):
+            # ── Image preprocessing ──────────────────────────────────────
+            # Step 1: Crop margins (5 % each side) to remove headers/footers
+            #         that confuse OCR column detection
+            w, h = img.size
+            margin_x = int(w * 0.03)
+            margin_y = int(h * 0.03)
+            cropped = img.crop((margin_x, margin_y, w - margin_x, h - margin_y))
+
+            # Step 2: Greyscale
+            grey = cropped.convert("L")
+
+            # Step 3: Contrast enhancement (factor 2.0 = strong boost)
+            contrasted = ImageEnhance.Contrast(grey).enhance(2.0)
+
+            # Step 4: Sharpen edges for crisper character boundaries
+            sharpened = contrasted.filter(ImageFilter.SHARPEN)
+            sharpened = sharpened.filter(ImageFilter.SHARPEN)  # twice for clarity
+
+            # Step 5: Otsu-style threshold → clean binary image improves OCR
+            #         Use PIL point() with an empirical threshold of 140
+            binary = sharpened.point(lambda px: 255 if px > 140 else 0, "L")
+
+            pil_images.append(sharpened)   # keep enhanced grey for Gemini Vision
+
+            # ── Tesseract OCR on binary image ────────────────────────────
+            try:
+                import shutil
+                import pytesseract  # type: ignore[import]
+
+                tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+                if not (tesseract_cmd and os.path.isfile(tesseract_cmd)):
+                    candidates = [
+                        "/usr/bin/tesseract",
+                        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+                        shutil.which("tesseract") or "",
+                    ]
+                    tesseract_cmd = next((p for p in candidates if p and os.path.isfile(p)), "")
+
+                if tesseract_cmd:
+                    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+                    # psm 6 = single uniform block, oem 3 = LSTM + legacy
+                    text = pytesseract.image_to_string(
+                        binary, config="--psm 6 --oem 3 -l eng"
+                    )
+                    if text.strip():
+                        ocr_parts.append(f"--- PAGE {i} ---\n{text}")
+                        logger.info(f"Vision OCR page {i}: {len(text)} chars")
+                else:
+                    logger.warning("Vision OCR: Tesseract binary not found")
+
+            except ImportError:
+                logger.warning("pytesseract not available for vision OCR")
+
+    except ImportError as e:
+        logger.warning(f"pdf2image not available for vision OCR: {e}")
+    except Exception as e:
+        logger.error(f"Vision OCR pipeline error: {e}")
+
+    return "\n".join(ocr_parts), pil_images
+
+
 # ── Text extraction orchestrator ──────────────────────────────────────────────
 
 def extract_pdf_text(file_bytes: bytes) -> str:
