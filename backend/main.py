@@ -358,60 +358,83 @@ def save_extracted_to_db(extracted: dict, filename: str) -> dict:
 
 GEMINI_PROMPT = """You are a data extraction AI for a South African bulk transport management system.
 
-Parse the document and return ONLY a valid JSON object (no markdown, no code fences, just raw JSON):
+Extract truck and order data from ANY transport document — weighbridge receipts, dispatch reports, loading lists, multi-truck WDR tables, or any similar format. The document type, company name, and field labels will vary; use the alias list below to map whatever labels appear to the correct output fields.
+
+Return ONLY a valid JSON object — no markdown, no code fences, no explanation:
 
 {
-  "orderNumber": "order number string or null",
-  "clientName": "mine or company name or null",
-  "product": "product code e.g. CHR001 or null",
-  "orderQty": total_quantity_tonnes_as_number_or_null,
+  "orderNumber": "order/job reference string or null",
+  "clientName": "client, mine, or company name or null",
+  "product": "material or product code or null",
+  "orderQty": total_quantity_as_number_or_null,
   "unit": "tons",
-  "originAddress": "source mine/site or null",
+  "originAddress": "source mine or site or null",
   "destinationAddress": "destination port or city or null",
   "pickupDate": "YYYY-MM-DD or null",
   "trucks": [
     {
-      "vehicleReg": "truck registration plate - REQUIRED",
+      "vehicleReg": "truck/horse registration plate — REQUIRED",
       "driverName": "driver full name or null",
-      "transporter": "transport company name or null",
+      "transporter": "transport company or null",
       "fleetNo": "fleet number or null",
-      "trailer1": "first trailer plate or null",
-      "trailer2": "second trailer plate or null",
+      "trailer1": "trailer 1 plate or null",
+      "trailer2": "trailer 2 plate or null",
       "driverId": "driver ID number or null",
-      "ticketNo": "weighbridge ticket or transaction number or null",
-      "grossWeight": gross_kg_as_integer_or_null,
-      "tareWeight": tare_kg_as_integer_or_null,
-      "netWeight": net_kg_as_integer_or_null,
+      "ticketNo": "ticket, docket, or transaction number or null",
+      "grossWeight": gross_mass_kg_as_integer_or_null,
+      "tareWeight": tare_mass_kg_as_integer_or_null,
+      "netWeight": nett_mass_kg_as_integer_or_null,
       "scheduledDate": "YYYY-MM-DD or null",
-      "status": "scheduled"
+      "status": "completed"
     }
   ]
 }
 
-WEIGHBRIDGE DETAIL REPORT (WDR) — Newton system used at South African mines:
-- ORDER NUMBER: extract from the "ORDER NUMBER:" summary box at the bottom of the report (e.g. ELD26-05-30, ZDE26-05-46), NOT from the ORDERNO column in the table rows
-- clientName: from the report title header e.g. "NORTHAM ELAND", "FARM ZONDEREINDE"
-- originAddress: mine name from the report title
-- orderQty: from "ORDER QTY:" in the summary box (value is already in tonnes)
-- pickupDate: date portion of the "Filter Range" start date, format YYYY-MM-DD
-- Each DISP transaction row = one truck entry:
-  - TRUCK REG column → vehicleReg (e.g. LGZ388MP)
-  - TRAN NO column → ticketNo (e.g. 1001301 or 136262)
-  - TARE column → tareWeight in kg (e.g. 19050)
-  - GROSS column → grossWeight in kg (e.g. 56950)
-  - NETT column → netWeight in kg (e.g. 37900)
-  - TRANSPORTER column → transporter (e.g. VRC)
-  - PRODUCT column → product (e.g. CHR001)
-  - DEST column → destinationAddress (e.g. DBN, BC)
-  - SUPPLIER column → originAddress on truck row (can leave null, use report-level originAddress)
-  - USER column is a weighbridge OPERATOR, NOT the truck driver — set driverName to null
-  - Set status = "completed" for all WDR trucks (they have been weighed and dispatched)
+FIELD ALIASES — map any of these labels to the corresponding output field:
+- vehicleReg   : Horse Reg, Truck Reg, Vehicle Reg, Registration, Reg No, Plate, Rego
+- driverName   : Driver, Driver Name, Driver Surname, Operator (only if it is a person driving, not a weighbridge attendant)
+- transporter  : Transporter, Transport Company, Carrier, Haulier
+- trailer1     : Trailer 1, Trailer 1 Reg, Semi-trailer 1, Trailer A
+- trailer2     : Trailer 2, Trailer 2 Reg, Semi-trailer 2, Trailer B
+- ticketNo     : Ticket No, Tran No, Transaction No, Docket No, Reference No, Ticket Number, Ref
+- grossWeight  : Gross Mass, Gross Weight, GROSS (convert to kg integers — if tonnes multiply by 1000)
+- tareWeight   : Tare Mass, Tare Weight, TARE, Tare (kg)
+- netWeight    : Nett Mass, Net Mass, Net Weight, NETT, Nett (kg)
+- orderNumber  : Order No, Order Number, ORDER NUMBER, Job No, Job Ref, Customer Ref, Reference, Ref No, SO No
+- clientName   : Client, Customer, Customer Name, Mine, Mine Name, Company
+- destinationAddress : Destination, DEST, Delivery Point, Deliver To
+- originAddress      : Origin, Source, From, Mine Site, Loading Point, Supplier
+- product      : Material, Product, Product Code, Grade, Commodity, Description
+- pickupDate   : Date, Datetime IN, Production Date, Loading Date, Dispatch Date, Filter Range start
+
+DOCUMENT TYPE RULES:
+
+1. SINGLE WEIGHBRIDGE RECEIPT (e.g. Windsor, any weighbridge slip):
+   - One truck per document → one entry in the "trucks" array
+   - Fields are presented as "Label: Value" pairs
+   - The Order No field may be a long combined reference string — use it as-is
+   - Datetime IN or Date field → scheduledDate (date portion only, YYYY-MM-DD)
+   - Weighbridge attendant / Operator / WB Attendant is NOT the driver — ignore for driverName
+   - Set status = "completed" if gross and tare weights are present
+
+2. MULTI-TRUCK WDR TABLE (e.g. Newton weighbridge system):
+   - Each DISP transaction row = one truck entry
+   - ORDER NUMBER comes from the summary box at the bottom, not the ORDERNO column in the table
+   - ORDER QTY in the summary box is already in tonnes
+   - Filter Range start date → pickupDate
+   - USER / Operator column = weighbridge operator, NOT the driver → driverName = null
+   - TRUCK REG → vehicleReg, TRAN NO → ticketNo, TARE → tareWeight, GROSS → grossWeight, NETT → netWeight
+
+3. LOADING LIST / ALLOCATION SHEET (Excel-style or tabular):
+   - Each row with a vehicle registration = one truck
+   - Extract all rows — do not skip or summarise
 
 GENERAL RULES:
-- Include ALL transaction rows — do not skip or summarise any
-- vehicleReg is REQUIRED — skip rows with no truck registration
-- Weight values must be plain integers. No units
+- vehicleReg is REQUIRED — omit any truck entry that has no registration plate
+- Weight values must be plain integers in kg — no units text, no decimals
 - All dates must be YYYY-MM-DD
+- Include every truck/row found — never summarise or truncate
+- If a field is genuinely absent from the document, use null
 - Return ONLY raw JSON — no explanation, no markdown
 
 DOCUMENT:
@@ -450,6 +473,7 @@ def call_gemini_vision(images: list) -> dict | None:
     """
     Send preprocessed PDF page images directly to Gemini 2.5 Flash Vision.
     Used when OCR text is too garbled for the regex parser to match.
+    Handles any document type — weighbridge slips, WDR tables, loading lists, etc.
     Returns parsed dict or None.
     """
     if not gemini_client or not images:
@@ -457,6 +481,7 @@ def call_gemini_vision(images: list) -> dict | None:
     try:
         from google.genai import types as _genai_types  # type: ignore[import]
 
+        # Build contents: images first, then the extraction prompt
         contents = []
         for img in images[:4]:   # cap at 4 pages to avoid token limits
             buf = io.BytesIO()
@@ -466,10 +491,13 @@ def call_gemini_vision(images: list) -> dict | None:
                     data=buf.getvalue(), mime_type="image/png"
                 )
             )
-        # Reuse the same structured extraction prompt
+
+        # Vision-specific instruction: tell Gemini to read the image directly
+        # and apply the same dynamic extraction rules as the text prompt
         contents.append(
-            GEMINI_PROMPT +
-            "\nExtract all transaction rows and order metadata visible in these document images."
+            "Read every visible field in this transport document image carefully — "
+            "it may be a weighbridge receipt, a multi-truck dispatch table, a loading list, "
+            "or any similar format.\n\n" + GEMINI_PROMPT
         )
 
         response = gemini_client.models.generate_content(
