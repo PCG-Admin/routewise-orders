@@ -249,6 +249,41 @@ def extract_with_vision_ocr(file_bytes: bytes) -> tuple[str, list]:
     return "\n".join(ocr_parts), pil_images
 
 
+# ── Simple PDF → images (for Gemini Vision fallback) ─────────────────────────
+
+def pdf_to_images(file_bytes: bytes) -> list:
+    """
+    Convert PDF pages to resized RGB PIL images ready for Gemini Vision.
+    Intentionally lightweight — no aggressive preprocessing, no Tesseract.
+    Used as a guaranteed image source when extract_with_vision_ocr fails or
+    when we need images regardless of whether OCR succeeded.
+
+    Images are resized to max 1 500 px wide and saved as JPEG-quality so they
+    stay well under Gemini's ~4 MB per-image inline data limit.
+    """
+    try:
+        from pdf2image import convert_from_bytes  # type: ignore[import]
+
+        raw = convert_from_bytes(file_bytes, dpi=200)
+        logger.info(f"pdf_to_images: {len(raw)} page(s)")
+        result = []
+        for img in raw:
+            # Keep colour — Gemini Vision reads natural images better than greyscale
+            rgb = img.convert("RGB")
+            # Resize if wider than 1 500 px to stay inside the inline-data limit
+            if rgb.width > 1500:
+                ratio = 1500 / rgb.width
+                rgb = rgb.resize((1500, int(rgb.height * ratio)))
+            result.append(rgb)
+        return result
+    except ImportError:
+        logger.warning("pdf2image not installed — pdf_to_images unavailable")
+        return []
+    except Exception as e:
+        logger.error(f"pdf_to_images error: {e}")
+        return []
+
+
 # ── Text extraction orchestrator ──────────────────────────────────────────────
 
 def extract_pdf_text(file_bytes: bytes) -> str:

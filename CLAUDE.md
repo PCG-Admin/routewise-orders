@@ -215,36 +215,58 @@ TESSERACT_CMD=/usr/bin/tesseract        ← set automatically in Docker
 
 ## PDF Extraction Pipeline
 
-**File:** `backend/pdf_extractor.py`
+**Files:** `backend/pdf_extractor.py` (text + images) · `backend/main.py` (Gemini calls + route)
 
-The main function is `extract_pdf_text(file_bytes) -> str`, called by the upload route in `main.py`.
+The `POST /api/upload/pdf` route runs a **7-stage pipeline**. Each stage only runs if the previous stage produced zero trucks. The pipeline handles any transport document — Newton WDR tables, Windsor weighbridge slips, scanned receipts, loading lists, etc.
 
 ```
-Stage 1: pdfplumber (primary)
-   - Extracts prose text AND tables (formatted as pipe-delimited rows)
-   - Best for Newton WDR reports — preserves column alignment
-   - If result >= 200 chars → use it
-
-Stage 2: PyPDF2 (secondary fallback)
-   - Faster, less accurate for tables
-   - If result >= 200 chars → use it
-
-Stage 3: Tesseract OCR (scanned PDF fallback)
-   - pdf2image converts pages to 300 DPI greyscale images
-   - pytesseract reads each image
-   - Used when stages 1+2 both return < 200 chars
-   - Tesseract binary: /usr/bin/tesseract (Docker) or Windows path fallback
-
-→ Text passed to Gemini 2.5 Flash (max 30,000 chars)
-→ Gemini returns structured JSON
-→ save_extracted_to_db() writes to Supabase
+Stage 1 — Text Extraction   pdfplumber → PyPDF2 → basic Tesseract OCR
+              (extract_pdf_text in pdf_extractor.py)
+   ↓
+Stage 2 — Regex Parsing     parse_wdr_text() — DISP row detection for Newton WDR format
+              Fast, no API call. Returns None if document is not a WDR.
+   ↓ (if no trucks)
+Stage 3 — Vision OCR        PDF page → 400 DPI image → crop margins → greyscale
+              → contrast ×2 → double sharpen → Otsu threshold → Tesseract
+              (extract_with_vision_ocr in pdf_extractor.py)
+              Returns: (ocr_text, preprocessed_pil_images)
+   ↓
+Stage 4 — Regex on OCR      Same parse_wdr_text() regex on the enhanced OCR text
+   ↓ (if still no trucks)
+Stage 5 — Gemini Vision     Images → Gemini 2.5 Flash Vision
+              Uses preprocessed images from Stage 3 if available;
+              falls back to pdf_to_images() (200 DPI, ≤1500px) so this
+              stage always has images even when Stage 3 OCR failed.
+              (call_gemini_vision in main.py)
+   ↓ (if still no trucks)
+Stage 6 — Gemini Text       Best available text → Gemini 2.5 Flash text mode
+              (call_gemini in main.py)
+   ↓
+Stage 7 — Supabase          save_extracted_to_db() writes order + truck_allocations
 ```
 
-**WDR PDF format** (Newton weighbridge system):
+### Key functions in `pdf_extractor.py`
+
+| Function | Purpose |
+|---|---|
+| `extract_text_pdfplumber(bytes)` | Primary text extractor — prose + pipe-delimited tables |
+| `extract_text_pypdf2(bytes)` | Secondary fallback |
+| `extract_text_ocr(bytes)` | Tesseract OCR at 300 DPI on greyscale image |
+| `extract_pdf_text(bytes)` | Orchestrates stages 1–3, returns best text |
+| `extract_with_vision_ocr(bytes)` | 400 DPI + image preprocessing → Tesseract; returns `(text, images)` |
+| `pdf_to_images(bytes)` | 200 DPI RGB PIL images for Gemini Vision; always succeeds if pdf2image is installed |
+| `parse_wdr_text(text)` | **DO NOT MODIFY** — compiled regex parser for Newton WDR DISP rows |
+
+### WDR PDF format (Newton weighbridge system)
 - Header: report title, mine name, filter date range
 - Table columns: DATE, TRAN NO, MINE TRANS, USER, ORDERNO, TRAN TYPE, TARE, GROSS, NETT, PRODUCT, TRUCK REG, TRANSPORTER, SUPPLIER, DEST
 - Summary box at bottom: ORDER NUMBER, ORDER QTY, TOTAL NET, ORDER REMAINING
 - Each DISP row = one truck dispatch
+
+### Windsor weighbridge slip format
+- Single receipt per file (one truck per document)
+- Fields as `Label: Value` pairs (e.g. `Order No:`, `Horse Reg:`, `Gross Mass:`)
+- Regex parser returns None → pipeline falls through to Gemini Vision or Gemini text
 
 ---
 
@@ -272,14 +294,32 @@ If no template matches → `excel_to_text()` converts entire sheet to pipe-delim
 
 **Prompt location:** `GEMINI_PROMPT` constant in `backend/main.py` (~line 359)
 
-Key rules encoded in the prompt:
-- `orderNumber` comes from the summary box at the bottom of WDR, NOT from the ORDERNO column
-- `clientName` comes from the report title header (e.g. "NORTHAM ELAND")
-- `pickupDate` comes from the "Filter Range" start date
-- `USER` column = weighbridge operator, NOT the driver → `driverName` is null for WDR
-- Weight values are plain integers in kg
-- All DISP rows = one truck each, status = "completed"
-- Returns raw JSON only (no markdown fences)
+The prompt is **fully dynamic** — it does NOT assume Newton/WDR format. It works for any transport document via a field alias list and three document-type rules.
+
+### Field aliases
+The prompt maps document-specific labels to standard output fields. Examples:
+- `vehicleReg` ← Horse Reg, Truck Reg, Vehicle Reg, Registration, Plate, Rego
+- `ticketNo` ← Ticket No, Tran No, Transaction No, Docket No, Reference No
+- `grossWeight` ← Gross Mass, Gross Weight, GROSS
+- `orderNumber` ← Order No, Order Number, Job No, Job Ref, Customer Ref, SO No
+
+### Document type rules encoded in prompt
+1. **Single weighbridge receipt** (Windsor etc.) — one truck per document, `Label: Value` pairs, weighbridge attendant ≠ driver
+2. **Multi-truck WDR table** (Newton) — each DISP row = one truck, ORDER NUMBER from summary box at bottom, not ORDERNO column
+3. **Loading list / allocation sheet** — each row with a vehicle reg = one truck
+
+### Two call modes
+
+| Function | When used | Input |
+|---|---|---|
+| `call_gemini(text)` | Stage 6 — text fallback | Plain text (max 30,000 chars) |
+| `call_gemini_vision(images)` | Stage 5 — vision mode | List of PIL images (≤4 pages) |
+
+`call_gemini_vision` makes two attempts:
+1. PIL images passed directly (google-genai v1.x native)
+2. JPEG bytes via `Part.from_bytes` (SDK compatibility fallback)
+
+Images are JPEG-compressed and capped at 1,500 px wide before sending to stay under Gemini's ~4 MB inline-data limit (`_prepare_jpeg()` helper inside the function).
 
 **Model:** `gemini-2.5-flash`
 **Client:** `google.genai` SDK (`from google import genai`)
@@ -414,3 +454,13 @@ The backend also needs Tesseract OCR installed for scanned PDF support:
 9. **Stats endpoint** — `GET /api/stats` fetches ALL orders and ALL trucks in two queries. If the database grows very large this will slow down the reports page. Consider pagination or aggregation views in Supabase at that point.
 
 10. **CSP + new API domains** — adding any `fetch()` call to a new external domain in the frontend requires updating `connect-src` in `next.config.mjs` AND redeploying the frontend, otherwise the browser silently blocks it with a CSP error.
+
+11. **`parse_wdr_text()` is frozen** — the compiled `_DISP_ROW` regex in `pdf_extractor.py` is the working Newton WDR parser. **Do not modify it.** It is only invoked when DISP rows are detected; non-WDR documents fall through to Gemini automatically.
+
+12. **Gemini Vision image size** — Gemini's inline-data limit is ~4 MB per image. `pdf_to_images()` uses 200 DPI and caps width at 1,500 px; `call_gemini_vision()` additionally JPEG-compresses (quality 85) before sending. Do not raise DPI above 200 in `pdf_to_images`.
+
+13. **Windsor receipts group into one order** — multiple Windsor slip uploads for the same Order No automatically append to the existing order because `save_extracted_to_db()` deduplicates by `orderNumber`. No manual linking needed.
+
+14. **Gemini Vision two-attempt fallback** — `call_gemini_vision()` first passes PIL images directly (google-genai v1.x native); if that raises an exception it retries with JPEG bytes via `Part.from_bytes`. This handles SDK version differences between local and Render environments.
+
+15. **`pdf_to_images` as guaranteed image source** — even when `extract_with_vision_ocr()` returns an empty image list (e.g. pdf2image unavailable during preprocessing), Stage 5 falls back to `pdf_to_images()` so Gemini Vision always has something to process. Both functions require `pdf2image` and `Pillow`.
