@@ -12,7 +12,7 @@ import re
 import logging
 
 from utils import safe_date, safe_float
-from pdf_extractor import extract_pdf_text, parse_wdr_text, extract_with_vision_ocr, pdf_to_images
+from pdf_extractor import extract_pdf_text, parse_wdr_text, extract_with_vision_ocr
 from excel_extractor import extract_excel_structured, excel_to_text
 
 logging.basicConfig(level=logging.INFO)
@@ -471,63 +471,35 @@ def call_gemini(text: str) -> dict | None:
 
 def call_gemini_vision(images: list) -> dict | None:
     """
-    Send PDF page images directly to Gemini 2.5 Flash Vision.
-    Works for any document type — weighbridge slips, WDR tables, loading lists, etc.
-
-    Two attempts:
-      1. PIL images passed directly (google-genai v1.x native support)
-      2. JPEG bytes via Part.from_bytes (fallback for SDK version differences)
-    Images are JPEG-compressed and capped at 1 500 px wide to stay under
-    Gemini's ~4 MB per-image inline-data limit.
+    Send preprocessed PDF page images directly to Gemini 2.5 Flash Vision.
+    Used when OCR text is too garbled for the regex parser to match.
+    Handles any document type — weighbridge slips, WDR tables, loading lists, etc.
+    Returns parsed dict or None.
     """
     if not gemini_client or not images:
         return None
-
-    # Strip the trailing "DOCUMENT:" marker — meaningless in image mode
-    vision_prompt = (
-        "Carefully read every visible field in this transport document image. "
-        "It may be a weighbridge slip, a multi-truck dispatch table, a loading list, "
-        "or any similar transport document. Apply the extraction rules below.\n\n"
-        + GEMINI_PROMPT.rsplit("DOCUMENT:", 1)[0].strip()
-    )
-
-    def _prepare_jpeg(img) -> bytes:
-        """Resize to ≤1 500 px wide and encode as JPEG for Gemini."""
-        from PIL import Image as _PILImage  # type: ignore[import]
-        rgb = img.convert("RGB") if img.mode != "RGB" else img
-        if rgb.width > 1500:
-            ratio = 1500 / rgb.width
-            rgb = rgb.resize((1500, int(rgb.height * ratio)), _PILImage.LANCZOS)
-        buf = io.BytesIO()
-        rgb.save(buf, format="JPEG", quality=85)
-        return buf.getvalue()
-
-    # ── Attempt 1: PIL images directly (google-genai v1.x native) ────────────
     try:
-        contents = list(images[:4]) + [vision_prompt]
-        response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=contents,
-        )
-        result = _parse_gemini_response(response.text)
-        if result:
-            logger.info(
-                f"Gemini Vision (PIL) extracted: order={result.get('orderNumber')}, "
-                f"trucks={len(result.get('trucks', []))}"
-            )
-        return result
-    except Exception as e1:
-        logger.warning(f"Gemini Vision PIL attempt failed: {e1} — trying JPEG bytes")
+        from google.genai import types as _genai_types  # type: ignore[import]
 
-    # ── Attempt 2: JPEG bytes via Part.from_bytes ─────────────────────────────
-    try:
-        from google.genai import types as _gt  # type: ignore[import]
+        # Build contents: images first, then the extraction prompt
         contents = []
-        for img in images[:4]:
+        for img in images[:4]:   # cap at 4 pages to avoid token limits
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
             contents.append(
-                _gt.Part.from_bytes(data=_prepare_jpeg(img), mime_type="image/jpeg")
+                _genai_types.Part.from_bytes(
+                    data=buf.getvalue(), mime_type="image/png"
+                )
             )
-        contents.append(vision_prompt)
+
+        # Vision-specific instruction: tell Gemini to read the image directly
+        # and apply the same dynamic extraction rules as the text prompt
+        contents.append(
+            "Read every visible field in this transport document image carefully — "
+            "it may be a weighbridge receipt, a multi-truck dispatch table, a loading list, "
+            "or any similar format.\n\n" + GEMINI_PROMPT
+        )
+
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
             contents=contents,
@@ -535,7 +507,7 @@ def call_gemini_vision(images: list) -> dict | None:
         result = _parse_gemini_response(response.text)
         if result:
             logger.info(
-                f"Gemini Vision (bytes) extracted: order={result.get('orderNumber')}, "
+                f"Gemini Vision extracted: order={result.get('orderNumber')}, "
                 f"trucks={len(result.get('trucks', []))}"
             )
         return result
@@ -604,13 +576,9 @@ async def upload_pdf(file: UploadFile = File(...)):
                     )
 
             # ── Stage 5: Gemini Vision (images → Gemini) ─────────────────
-            if not (extracted and extracted.get("trucks")):
-                # Use vision-OCR preprocessed images if available; fall back to
-                # plain pdf_to_images so this stage always runs for any PDF.
-                vision_images = page_images if page_images else pdf_to_images(contents)
-                if vision_images:
-                    logger.info("Trying Gemini Vision")
-                    extracted = call_gemini_vision(vision_images)
+            if not (extracted and extracted.get("trucks")) and page_images:
+                logger.info("Regex on OCR found no trucks — trying Gemini Vision")
+                extracted = call_gemini_vision(page_images)
 
             # ── Stage 6: Gemini text fallback ─────────────────────────────
             if not (extracted and extracted.get("trucks")):
